@@ -14,7 +14,8 @@
        必须带齐关键文件；解压到临时目录后还要真跑一次 `import engine`；
     ④ 备份即将被覆盖的旧文件到 `_backup/v旧_时间戳/`；
     ⑤ 逐个文件二进制覆盖（bat 是 GBK+CRLF，绝不能重新编码）；
-    ⑥ 告诉你"重启才生效"。
+    ⑥ 把所在文件夹名里的旧版本号换成新的（只改"本来就叫 ...-vX.Y"的，见五之二）；
+    ⑦ 告诉你"重启才生效"。
 
 ★★ 三条铁律（照着写，别简化）：
   1. **只覆盖 .zip 里真实存在的文件**。绝不删任何东西 —— 你的 names.json、
@@ -366,6 +367,80 @@ def install(binary, base=None, expect_ver="", old_ver=""):
 
 
 # ======================================================================
+# 五之二、更新后把所在文件夹改名成新版本号
+# ======================================================================
+def rename_plan(base=None, new_ver=""):
+    """算出"文件夹名里那个版本号该换成什么"。返回 (旧路径, 新路径) 或 None。
+
+    只处理【名字里本来就带 vX.Y】的文件夹（如 `plant-vs-plant-v0.72`）——
+    那是"解压出来的包"的命名，更新完让它跟上版本号，免得看着还以为没升。
+    用户自己起的名字（"植物斗争""我的游戏"）**一律不动**，那是他的东西。
+    """
+    base = os.path.abspath(base or BASE_DIR)
+    name = os.path.basename(base.rstrip("\\/"))
+    m = re.search(r"v\d+(?:\.\d+)+", name)
+    if not m or not new_ver:
+        return None
+    new_name = name[:m.start()] + new_ver + name[m.end():]
+    if new_name == name:
+        return None
+    new_path = os.path.join(os.path.dirname(base), new_name)
+    if os.path.exists(new_path):
+        return None                      # 同名目录已存在，别去覆盖别人的
+    return base, new_path
+
+
+# 助手脚本：隔 0.5 秒试一次，直到那个窗口关掉（最多等 5 分钟）。
+# 写成独立进程而不是线程 —— 要等的是"本进程退出"，同一进程里等不到。
+_RENAME_HELPER = r'''
+import os, sys, time
+old, new = sys.argv[1], sys.argv[2]
+deadline = time.time() + 300
+while time.time() < deadline:
+    if not os.path.exists(old):
+        break
+    try:
+        os.rename(old, new)
+        break
+    except OSError:
+        time.sleep(0.5)
+'''
+
+
+def schedule_rename(base=None, new_ver="", quiet=False):
+    """把"改名"这件事交给一个脱离出去的助手进程去等。
+
+    ★★ 为什么不能就地改：Windows 下，一个目录只要还是某个进程的**当前工作目录**
+       就改不了名（cmd.exe 和 python 都算）。而更新完的那一刻，用户面前那个窗口
+       的 CWD 正是它 —— 直接 os.rename 必然 PermissionError。
+       所以：助手进程的 cwd 放在**父目录**，它不锁目标，等那个窗口关掉/程序重启
+       之后（锁一松）立刻改掉。
+    ★ 失败绝不影响任何东西：最坏结果只是名字没改上，游戏照常跑。
+    """
+    pair = rename_plan(base, new_ver)
+    if not pair:
+        return None
+    old, new = pair
+    flags = 0
+    if os.name == "nt":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP：不跟着本进程一起死，
+        # 也不抢控制台（否则关窗口时会被一起带走）
+        flags = 0x00000008 | 0x00000200
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _RENAME_HELPER, old, new],
+            cwd=os.path.dirname(old) or None,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
+    except Exception as exc:                       # noqa: BLE001
+        if not quiet:
+            print("  （文件夹改名没排上：%s —— 手动改成 %s 也行）"
+                  % (exc, os.path.basename(new)))
+        return None
+    return old, new
+
+
+# ======================================================================
 # 六、命令行
 # ======================================================================
 def _progress(done, total):
@@ -454,6 +529,10 @@ def main(argv=None):
         print("  覆盖 %d 个文件（备份 %d 个 → %s）"
               % (r["files"], r["backup_files"], r["backup"]))
         print("\n已更新到 %s。" % info["tag"])
+        rp = schedule_rename(new_ver=info["tag"])
+        if rp:
+            print("  这个文件夹会在窗口关掉后自动改名：%s → %s"
+                  % (os.path.basename(rp[0]), os.path.basename(rp[1])))
         print("★ 请【关掉程序重新打开】才生效 —— 现在跑的仍然是旧代码。")
         return 0
     except BadPackage as exc:

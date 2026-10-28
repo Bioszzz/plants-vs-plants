@@ -87,10 +87,21 @@ function ensureRules(opts, defs) {
     cb.id = 'f-rule-' + o.key;
     cb.checked = (o.key in cache) ? !!cache[o.key] : !!o.default_on;
     lab.appendChild(cb);
+    // 【v0.73】名称 + 一行简介（一直显示，不再只藏在 title 里）——
+    //   用户 2026-10-27："规则集添加简介"。勾选框只占左边一格，文字竖排两行。
+    const tx = document.createElement('div');
+    tx.className = 'rule-text';
     const sp = document.createElement('span');
+    sp.className = 'rule-name';
     sp.textContent = o.name;
-    if (o.desc) sp.title = o.desc;
-    lab.appendChild(sp);
+    tx.appendChild(sp);
+    if (o.desc) {
+      const dc = document.createElement('span');
+      dc.className = 'rule-desc';
+      dc.textContent = o.desc;
+      tx.appendChild(dc);
+    }
+    lab.appendChild(tx);
     box.appendChild(lab);
   });
 }
