@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>植物斗争 · 房主控制台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <h1>房主控制台</h1>
+    </div>
+    <div class="meta">
+      <span id="seed-chip" class="chip">开局种子 0</span>
+      <span id="round-chip" class="chip">第 0 回合</span>
+      <span id="state-chip" class="chip">未开局</span>
+    </div>
+  </header>
+
+  <!-- 房间设置：房主在这里定参数，点「开局」。
+       房主【不下场】—— 只在这里看战报和场面（见 netserver.py 的 Room）。 -->
+  <section id="setup" class="panel">
+    <div class="panel-title">房间设置（房主不下场，只观战）</div>
+    <div class="host-grid">
+      <label class="field">
+        <span>人数（含电脑）</span>
+        <input id="f-total" type="number" min="2" value="2" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>其中电脑数</span>
+        <input id="f-bots" type="number" min="0" value="0" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>开局种子（每人）</span>
+        <input id="f-seeds" type="number" min="0" value="0" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>游戏端口</span>
+        <input id="f-port" type="number" min="1" max="65535" value="8080" inputmode="numeric">
+      </label>
+    </div>
+    <!-- 【v0.49】可选规则集：勾选框【不再写死】—— 由 host.js 按服务端 status
+         带下来的 rule_options 动态生成（加一条规则只改 plants_data.RULE_OPTIONS）。
+         勾选缓存在浏览器 localStorage，下次打开控制台自动带出。 -->
+    <div class="panel-title" style="margin-top:12px">房间规则（可选）</div>
+    <div id="f-rules" class="host-grid"></div>
+    <div class="row">
+      <button id="btn-save" class="btn">确定（保存设置）</button>
+      <button id="btn-start" class="btn primary">开局</button>
+      <button id="btn-stop" class="btn danger" disabled>停止</button>
+    </div>
+    <div id="setup-err" class="err"></div>
+    <!-- 【v0.43】参数与规则【存没存下去】的回执：不再靠猜 -->
+    <div id="setup-saved" class="saved"></div>
+    <!-- 【v0.43】已连接的玩家（编号 + 名称 + 来源），等人时用来定位问题 -->
+    <div id="joined-list" class="joined"></div>
+    <div id="conn-tip" class="tip"></div>
+  </section>
+
+  <section id="board" class="panel">
+    <div class="panel-title">场面</div>
+    <div id="players"></div>
+    <div id="tags"></div>
+  </section>
+
+  <section id="logwrap" class="panel">
+    <div class="panel-title">战报</div>
+    <div id="log"></div>
+  </section>
+
+</div>
+
+<script src="host.js"></script>
+</body>
+</html>

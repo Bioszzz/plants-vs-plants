@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>植物斗争</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <h1>植物斗争</h1>
+    </div>
+    <div class="meta">
+      <span id="srv-chip" class="chip hidden"></span>
+      <button id="btn-disc" class="chip hidden">断开</button>
+      <span id="round-chip" class="chip">第 0 回合</span>
+      <span id="me-chip" class="chip me">未连接</span>
+    </div>
+  </header>
+
+  <section id="board" class="panel">
+    <div class="panel-title">场面</div>
+    <!-- 【v0.35】存活环：还活着的人按座位围成一圈，现场摘人。
+         选目标和读名字都靠它（引擎 state 里的 ring 字段）。 -->
+    <div id="ringwrap" class="hidden">
+      <div class="ring-title">存活环（环上只剩这些人）</div>
+      <div id="ring"></div>
+      <!-- 【v0.62】队友链图例：哪几个人是一队的（纯展示，读引擎 state.teams）。 -->
+      <div id="ring-legend" class="ring-legend"></div>
+      <!-- 【v0.44】"空目标"出口：点环选人时，这里是"不选任何人"的按钮
+           （目前用于刀类的"不切" —— 用户 2026-10-12："存活环旁边最好再加
+            一个『空目标』选项"）。 -->
+      <div id="ring-extra"></div>
+    </div>
+    <div id="players"></div>
+    <div id="tags"></div>
+  </section>
+
+  <!-- 【v0.44】"你的操作"上移到【战报上方】：让存活环与交互按钮相邻，
+       战报退到最下面（用户 2026-10-12："存活环和交互按钮中隔了一个战报。
+       战报应该放在最下面，存活环和交互相邻"）。 -->
+  <section id="deck" class="panel">
+    <div class="panel-title" id="deck-title">你的操作</div>
+    <div id="deck-body">
+      <div class="hint">未连接</div>
+    </div>
+  </section>
+
+  <section id="logwrap" class="panel">
+    <div class="panel-title">战报</div>
+    <div id="log"></div>
+  </section>
+
+</div>
+
+<!-- 连接界面：连上服务器之前盖住整个页面 -->
+<div id="connect" class="overlay">
+  <div class="connect-card">
+    <div class="brand big">
+      <span class="logo"></span>
+      <h1>植物斗争</h1>
+    </div>
+    <p class="sub">网页版客户端 —— 连上服务器开始对局</p>
+
+    <!-- 【v0.35】起名：进房前给自己起个名字，战报里就显示"名字(编号)"。
+         名字缓存在本机（webui 同目录的 names.json），下次自动带出。 -->
+    <label class="field">
+      <span>你的名字</span>
+      <input id="myname" maxlength="16" placeholder="不填就用 player1 / player2 …"
+             list="name-history" spellcheck="false" autocomplete="off">
+    </label>
+    <datalist id="name-history"></datalist>
+
+    <label class="field">
+      <span>服务器 IP</span>
+      <input id="ip" value="127.0.0.1" spellcheck="false" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>端口</span>
+      <input id="port" value="8080" inputmode="numeric" autocomplete="off">
+    </label>
+    <button id="btn-connect" class="btn primary wide">连接服务器</button>
+
+    <div id="conn-err" class="err"></div>
+
+    <div class="or"><span>或</span></div>
+
+    <!-- 【v0.22】本机开一局的参数：人数 / 电脑数 / 开局种子。
+         默认 2 人局、1 个电脑、开局种子 0（= 空手起手，和以前一模一样）。 -->
+    <div class="local-row">
+      <label class="lite">
+        <span>人数</span>
+        <input id="l-total" type="number" min="2" value="2" inputmode="numeric">
+      </label>
+      <label class="lite">
+        <span>电脑</span>
+        <input id="l-bots" type="number" min="0" value="1" inputmode="numeric">
+      </label>
+      <label class="lite">
+        <span>开局种子</span>
+        <input id="l-seeds" type="number" min="0" value="0" inputmode="numeric">
+      </label>
+    </div>
+    <!-- 【v0.49】可选规则集：勾选框【不再写死】—— 由 app.js 按服务端给的
+         rule_options 动态生成（加一条规则只改 plants_data.RULE_OPTIONS）。
+         上次勾了什么记在浏览器 localStorage 里，下次打开自动带出。 -->
+    <div class="panel-title" style="margin:10px 0 4px">可选规则</div>
+    <div id="l-rules"></div>
+    <button id="btn-local" class="btn wide">本机开一局（你 vs 电脑）</button>
+
+    <p class="tip">
+      局域网联机：房主运行 <code>python netserver.py</code>（自带房主控制台网页），<br>
+      其他人在上面填房主的内网 IP 再点「连接服务器」。<br>
+      本机局如果留了真人位，其他人填 <code>127.0.0.1</code> 就能加进来。
+    </p>
+
+    <!-- 【v0.19】版次与检查更新。
+         版本号由 webui.py 从 VERSION 文件（git tag 生成）读出来下发，
+         页面上不写死 —— 否则每次发版都要改前端，迟早忘了改。 -->
+    <div class="ver">
+      <span>版次</span><span class="vno" id="ver-no">…</span>
+      <button class="lnk" id="btn-update">检查更新</button>
+    </div>
+    <div class="newver" id="ver-msg"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

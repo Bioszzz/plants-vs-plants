@@ -1,0 +1,655 @@
+/* 植物斗争 —— 网页版界面骨架
+   骨架阶段：占位美术用「色相 + 首字」的色块，等正式插画做好直接替换 .plant-art。
+   配色：深墨绿底 + 植物绿主色，火/水两种资源各给一个语义色。 */
+
+:root {
+  --bg: #121815;
+  --panel: #1a211d;
+  --card: #222c26;
+  --card-hi: #2b3830;
+  --line: #33423a;
+  --text: #e6efe8;
+  --text-dim: #93a89a;
+  --green: #5ec27a;
+  --green-dim: #3d7d50;
+  --fire: #e2703a;
+  --water: #4aa8d8;
+  --superdef: #e8c86a;   /* v0.18 超防：绝对免伤，用金色区别于水/火 */
+  --immune: #a98be0;     /* v0.54 免疫：清负面层，用紫色区别于超防的金 */
+  --danger: #e05a5a;
+  --gold: #d9b45b;
+  --radius: 12px;
+  --shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100vh;
+}
+
+/* ---------- 顶栏 ---------- */
+#topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 4px 0;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.logo {
+  width: 26px; height: 26px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--green), var(--green-dim));
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,.08);
+}
+#topbar h1 { font-size: 17px; font-weight: 500; margin: 0; letter-spacing: 2px; }
+.meta { display: flex; gap: 8px; }
+.chip {
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  background: var(--card); color: var(--text-dim); border: 1px solid var(--line);
+}
+.chip.me { color: var(--green); border-color: var(--green-dim); }
+
+/* ---------- 通用面板 ---------- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+}
+.panel-title {
+  font-size: 12px; color: var(--text-dim);
+  letter-spacing: 1px; margin-bottom: 10px;
+}
+
+/* ---------- 场面：玩家卡片 ---------- */
+#players {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+}
+.pcard {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  transition: transform .15s, border-color .15s, box-shadow .15s;
+}
+.pcard.me { border-color: var(--green-dim); }
+.pcard.dead { opacity: .45; filter: grayscale(.6); }
+.pcard.hurt { animation: hurt .5s; }
+@keyframes hurt {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-5px); box-shadow: 0 0 0 2px var(--danger); }
+  60% { transform: translateX(5px); box-shadow: 0 0 0 2px var(--danger); }
+}
+
+.pcard-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.pname { font-size: 13px; font-weight: 500; }
+.pname .tag-me { color: var(--green); font-size: 11px; margin-left: 6px; }
+
+/* 生命：用格子表示，1 条命 = 2 格 */
+.hp { display: flex; gap: 3px; }
+.hp i {
+  width: 11px; height: 11px; border-radius: 3px;
+  background: var(--danger); display: block;
+}
+.hp i.half { background: linear-gradient(90deg, var(--danger) 50%, #3a2a2a 50%); }
+.hp i.empty { background: #333b36; }
+
+.stats { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.stat {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: #1d2521; border: 1px solid var(--line); color: var(--text-dim);
+}
+.stat b { color: var(--text); font-weight: 500; }
+.stat.water { color: var(--water); border-color: #2b4d63; }
+.stat.fire { color: var(--fire); border-color: #5e3823; }
+.stat.superdef { color: var(--superdef); border-color: #6b5a2a; }
+.stat.immune { color: var(--immune); border-color: #4d3f6b; }
+
+/* 场上植物 */
+.slot { display: flex; align-items: center; gap: 10px; }
+.plant-art {
+  width: 42px; height: 42px; border-radius: 10px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 500; color: #0e1512;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.25);
+}
+.slot-info { min-width: 0; }
+.slot-name { font-size: 13px; }
+.slot-sub { font-size: 11px; color: var(--text-dim); }
+.slot-sub .broken { color: var(--danger); }
+.slot-sub .inert { color: var(--gold); }
+
+/* ---------- 战报 ---------- */
+#logwrap { flex: 1 1 auto; min-height: 120px; display: flex; flex-direction: column; }
+#log {
+  flex: 1 1 auto; overflow-y: auto; max-height: 220px;
+  font-size: 13px; color: var(--text-dim);
+  display: flex; flex-direction: column; gap: 3px;
+  padding-right: 4px;
+}
+#log div { animation: fadein .25s; }
+@keyframes fadein { from { opacity: 0; transform: translateY(3px); } }
+#log .hl { color: var(--text); }
+#log .dmg { color: var(--danger); }
+#log .good { color: var(--green); }
+#log .sys { color: var(--gold); }
+
+/* ---------- 决策区 ---------- */
+#deck { flex: 0 0 auto; }
+#deck-body { min-height: 76px; }
+.hint { color: var(--text-dim); font-size: 13px; padding: 12px 0; }
+.qtip { font-size: 13px; margin-bottom: 10px; color: var(--text); }
+
+/* 【v0.72】每道题都要先说清"这是【谁的】哪株植物在做什么" ——
+   用户 2026-10-27 的截图里只有一个裸的"选择攻击目标"，
+   他根本看不出这一问是在替谁答。 */
+.qfrom {
+  font-size: 13px; color: var(--text);
+  border-left: 3px solid var(--gold);
+  padding: 2px 0 2px 8px; margin-bottom: 8px;
+}
+.qfrom b { color: var(--gold); font-weight: 600; }
+.qsub { font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+
+.row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 主按钮 */
+.btn {
+  background: var(--card-hi); color: var(--text);
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 18px; font-size: 13px; font-family: inherit;
+  cursor: pointer; transition: transform .12s, background .12s, border-color .12s;
+}
+.btn:hover:not(:disabled) { background: #34443a; transform: translateY(-1px); }
+.btn:active:not(:disabled) { transform: translateY(0); }
+.btn.primary { background: var(--green-dim); border-color: var(--green); color: #f2fff5; }
+.btn.primary:hover:not(:disabled) { background: #478f5b; }
+.btn.danger { border-color: #6d3636; color: #f0b8b8; }
+.btn:disabled { opacity: .45; cursor: default; }
+
+/* 植物选牌网格 */
+.picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 8px;
+  max-height: 300px; overflow-y: auto; padding-right: 4px;
+}
+.pick {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; padding: 8px 10px; cursor: pointer; text-align: left;
+  color: var(--text); font-family: inherit;
+  transition: transform .12s, border-color .12s, background .12s;
+}
+.pick:hover:not(:disabled) {
+  transform: translateY(-2px); border-color: var(--green); background: var(--card-hi);
+}
+.pick:disabled { opacity: .4; cursor: default; }
+/* 【v0.53】卡片只剩一行：编号 / 名字 / 耗种。整段简介在悬停浮层里（#ptip）。 */
+.pick-top { display: flex; align-items: center; gap: 8px; }
+.pick-art {
+  width: 28px; height: 28px; border-radius: 8px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 500; color: #0e1512;
+}
+.pick-name { font-size: 13px; font-weight: 500; }
+.pick-cost { font-size: 11px; color: var(--gold); }
+
+/* 【v0.53】植物简介浮层（悬停展开）—— 卡片瘦身的配套。
+   ★ position:fixed 挂在 body 下（app.js 的 #ptip 单例），不用 .pick 里的绝对定位子元素：
+     #pk-list 是 overflow-y:auto，卡内浮层会被容器裁掉。
+   ★ pointer-events:none —— 浮层不吃鼠标，扫过一排卡片不会因为"压到下一张"而闪。 */
+#ptip {
+  position: fixed; z-index: 60; display: none;
+  width: 320px; max-width: calc(100vw - 16px);
+  background: var(--card-hi); border: 1px solid var(--line);
+  border-radius: 10px; padding: 9px 12px 10px; box-shadow: var(--shadow);
+  font-size: 12px; line-height: 1.55; color: var(--text-dim);
+  pointer-events: none;
+}
+#ptip .ptip-head {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 13px; color: var(--text); margin-bottom: 5px;
+}
+#ptip .ptip-no { font-size: 11px; color: var(--green); }
+#ptip .ptip-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 5px; }
+#ptip .ptip-chip {
+  font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: #1d2521; border: 1px solid var(--line); color: var(--text-dim);
+}
+#ptip .ptip-row + .ptip-row { margin-top: 4px; }
+#ptip .ptip-row:last-child { color: var(--text); }
+
+/* 目标卡 */
+.targets { display: flex; flex-wrap: wrap; gap: 8px; }
+.tcard {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 14px; cursor: pointer; color: var(--text); font-family: inherit;
+  min-width: 130px; text-align: left;
+  transition: transform .12s, border-color .12s, background .12s;
+}
+.tcard:hover:not(:disabled) {
+  transform: translateY(-2px); border-color: var(--danger); background: var(--card-hi);
+}
+.tcard.sel { border-color: var(--danger); background: #33241f; }
+.tcard:disabled { opacity: .4; cursor: default; }
+.tcard .t-name { font-size: 13px; font-weight: 500; }
+.tcard .t-sub { font-size: 11px; color: var(--text-dim); }
+/* 【v0.21】噬魂类：吞不动的目标压暗一层（仍可点 —— 规则上允许"白打一下"，
+   界面只负责把代价摆在明面上，不替玩家做决定）。 */
+.tcard.hard { opacity: .6; }
+.tcard .t-sub .ok { color: var(--gold); }
+.tcard .t-sub .no { color: var(--danger); }
+.devour-hint { color: var(--gold); margin-bottom: 6px; }
+
+/* 【v0.44】连击发数分配：每个目标一张卡，卡上带"− / 数字 / ＋"。
+   点存活环上的目标 = 给这张卡 +1 发（与点 ＋ 同一个出口）。 */
+.tcard.burst { cursor: default; display: flex; flex-direction: column; gap: 6px; }
+.tcard.burst .alloc { display: flex; align-items: center; gap: 6px; }
+.tcard.burst .mini {
+  width: 28px; height: 26px; line-height: 1; font-size: 15px;
+  background: #161d19; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; cursor: pointer; font-family: inherit;
+}
+.tcard.burst .mini:hover { border-color: var(--green); }
+.tcard.burst .cnt {
+  width: 56px; background: #161d19; color: var(--text); text-align: center;
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px;
+  font-size: 14px; font-family: inherit;
+}
+.tcard.burst .cnt:focus { outline: none; border-color: var(--green); }
+/* 环旁边的"空目标/不切"按钮（目前只有刀类用） */
+#ring-extra { margin-top: 8px; text-align: center; }
+#ring-extra .btn { font-size: 12px; }
+
+/* 出牌搜索（v0.15+）：植物多了以后，按编号（4=耗种段 / 45=完整）或名称快速定位 */
+.pk-search { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.pk-search input {
+  flex: 1; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; font-family: inherit;
+}
+.pk-search input:focus { outline: none; border-color: var(--green); }
+.pk-count { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.pick-no {
+  display: inline-block; min-width: 20px; margin-right: 5px; padding: 0 4px;
+  font-size: 11px; color: var(--green); border: 1px solid var(--line);
+  border-radius: 5px; text-align: center; line-height: 16px; vertical-align: 1px;
+}
+
+/* 充能 / 水滴输入 */
+.numrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.numrow input {
+  width: 90px; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 10px; font-size: 14px; font-family: inherit;
+}
+.numrow input:focus { outline: none; border-color: var(--green); }
+
+/* 等待遮罩 */
+.waiting { display: flex; align-items: center; gap: 10px; color: var(--text-dim); padding: 12px 0; }
+.dots { display: inline-flex; gap: 4px; }
+.dots i {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+  animation: blink 1.2s infinite;
+}
+.dots i:nth-child(2) { animation-delay: .2s; }
+.dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }
+
+/* 结束 */
+.over { text-align: center; padding: 18px 0; }
+.over .big { font-size: 20px; color: var(--gold); margin-bottom: 6px; }
+.over .sub { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; }
+.over .btns { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.over .err { margin: 10px 0 0; }
+
+/* 出局观战（v0.15）：出局不是离桌 —— 场面和战报照旧刷新，只是没有操作要做 */
+.spectate { text-align: center; padding: 16px 0; }
+.spectate .spec-big { font-size: 16px; color: var(--text); margin-bottom: 8px; }
+.spectate .spec-sub { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.slot-sub.out { color: var(--danger); letter-spacing: 1px; }
+.pcard.dead .pname { text-decoration: line-through; text-decoration-color: var(--text-dim); }
+
+/* ---------- 连接界面 ---------- */
+.hidden { display: none !important; }
+
+#srv-chip { color: var(--green); border-color: var(--green-dim); }
+#btn-disc {
+  font-family: inherit; cursor: pointer; transition: color .12s, border-color .12s;
+}
+#btn-disc:hover { color: var(--danger); border-color: #6d3636; }
+
+.overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  background: radial-gradient(1200px 600px at 50% 0%,
+              #1b241f 0%, var(--bg) 60%);
+  animation: fadein .25s;
+}
+.connect-card {
+  width: 100%; max-width: 340px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  padding: 24px 22px 18px;
+}
+.connect-card .brand.big { justify-content: center; margin-bottom: 2px; }
+.connect-card .brand.big .logo { width: 32px; height: 32px; }
+.connect-card .brand.big h1 { font-size: 20px; }
+.connect-card .sub {
+  text-align: center; font-size: 12px; color: var(--text-dim);
+  margin: 0 0 20px;
+}
+
+.field { display: block; margin-bottom: 12px; }
+.field span {
+  display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 5px;
+}
+.field input {
+  width: 100%; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 9px;
+  padding: 10px 12px; font-size: 14px; font-family: inherit;
+}
+.field input:focus { outline: none; border-color: var(--green); }
+
+.btn.wide { display: block; width: 100%; text-align: center; }
+
+/* 【v0.22】「本机开一局」的参数行：人数 / 电脑 / 开局种子 三个小格。
+   连接卡片本来就窄，所以用小号居中输入框 —— 不能让几个数字把卡片撑长。 */
+.local-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.local-row .lite { display: block; }
+.local-row .lite span {
+  display: block; font-size: 11px; color: var(--text-dim);
+  margin-bottom: 4px; text-align: center;
+}
+.local-row .lite input {
+  width: 100%; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 6px; font-size: 13px; font-family: inherit; text-align: center;
+}
+.local-row .lite input:focus { outline: none; border-color: var(--green); }
+
+/* 【v0.25】房间规则勾选项（房主控制台 / 本机开一局各一处）。
+   单独一个类，不蹭 .field / .lite —— 那两个把 input 撑成 100% 宽，
+   套在复选框上会变成一条横贯整行的方块。 */
+.rulecheck {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-dim);
+  margin: 2px 0 12px; text-align: left; cursor: pointer;
+}
+.rulecheck input { width: auto; margin: 0; flex: none; }
+
+.err {
+  min-height: 18px; font-size: 12px; color: var(--danger);
+  margin: 8px 0 2px; text-align: center; word-break: break-all;
+}
+
+.or {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text-dim); font-size: 11px; margin: 12px 0;
+}
+.or::before, .or::after {
+  content: ""; flex: 1 1 auto; height: 1px; background: var(--line);
+}
+
+.tip {
+  font-size: 11px; color: var(--text-dim); line-height: 1.6;
+  margin: 16px 0 0; text-align: center;
+}
+.tip code {
+  font-family: Consolas, Menlo, monospace; font-size: 11px;
+  background: #161d19; border: 1px solid var(--line);
+  border-radius: 5px; padding: 1px 5px; color: var(--gold);
+}
+
+/* 【v0.43】房主控制台：「设置已保存」回执 + 「已连接玩家」列表。
+   回执是服务端真正存着的那一份（不是房主自己勾的），所以可以放心据此判断"生效没有"。 */
+.saved {
+  font-size: 12px; color: var(--text-dim); line-height: 1.6;
+  margin: 6px 0 0; text-align: center; word-break: break-all;
+}
+.saved.ok { color: var(--green); }
+.joined {
+  font-size: 12px; color: var(--text); line-height: 1.7;
+  margin: 6px 0 0; text-align: center; word-break: break-all;
+}
+.joined b { color: var(--green); }
+.joined .from {
+  color: var(--text-dim); font-size: 11px;
+  font-family: Consolas, Menlo, monospace;
+}
+
+/* 【v0.19】连接面板：版次 + 检查更新
+   —— 玩家报告问题时，第一句要问的就是"你是什么版本"，所以必须让人看得见。 */
+.ver {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  margin-top: 14px; font-size: 11px; color: var(--text-dim);
+}
+.ver .vno { color: var(--gold); font-family: Consolas, Menlo, monospace; }
+.ver .lnk {
+  background: none; border: none; padding: 0; margin: 0;
+  color: var(--green); font-size: 11px; font-family: inherit;
+  text-decoration: underline; cursor: pointer;
+}
+.ver .lnk:disabled { color: var(--text-dim); text-decoration: none; cursor: default; }
+.newver {
+  font-size: 11px; line-height: 1.65; color: var(--text-dim);
+  text-align: center; margin: 8px 0 0;
+}
+.newver .tag {
+  color: var(--green); font-family: Consolas, Menlo, monospace; font-weight: 600;
+}
+.newver .dl { color: var(--water); }
+
+/* 【v0.16】人参果段标记：哪一段被埋了、累积几笔、谁埋的
+   （数据来自 state_json 的 tag_marks，见 app.js::renderTags） */
+#tags { margin-top: 8px; }
+#tags:empty { display: none; }
+.tags-title { font-size: 12px; color: var(--text-dim); margin: 6px 0 4px; }
+.tagrow {
+  display: flex; gap: 8px; align-items: center;
+  font-size: 12px; padding: 4px 8px; border-radius: 8px;
+  background: var(--card); border: 1px solid var(--line); margin-bottom: 4px;
+}
+.tagrow.hot { border-color: var(--danger); color: var(--danger); }
+.tagrow .seg { color: var(--gold); font-weight: 600; }
+.tagrow .cnt { font-weight: 600; }
+.tagrow .own { color: var(--text-dim); }
+
+/* ---------- 【v0.35】存活环（场面区顶部的一圈） ----------
+   还活着的人按座位围成一圈，实时摘人（引擎 ring 字段）。
+   ★ 节点用 transform 从圆心摆放（app.js 算好 x/y），容器是个固定大小的方框。 */
+#ringwrap { margin: 8px 0 12px; }
+#ringwrap.hidden { display: none; }
+.ring-title { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
+#ring { display: flex; justify-content: center; padding: 6px 0; }
+.ring-circle {
+  /* 【v0.37】节点从 62px 加宽到 96px → 圈同步放大，免得邻居互相压住。
+     【v0.45】用户："最好把存活环做得大一点" → 260 → 340（半径 78 → 112）。 */
+  position: relative; width: 340px; height: 340px;
+  border-radius: 50%;
+  border: 1px dashed var(--line);         /* 虚线圈 = "环"本身 */
+  background: radial-gradient(circle, rgba(94,194,122,.06), transparent 70%);
+}
+/* 【v0.45】队友链连线（星形图）：零尺寸 + overflow:visible，画在圆心上，
+   所以 line 的坐标 = app.js 算出的"相对圆心"偏移，不需要再换算。
+   pointer-events:none —— 绝不能挡住环上的点击选人。 */
+.ring-links {
+  position: absolute; left: 50%; top: 50%;
+  overflow: visible; pointer-events: none; z-index: 0;
+}
+.ring-links line {
+  stroke: var(--gold); stroke-width: 3;
+  /* 【v0.62】线色由 app.js 按队色内联覆盖（这里只是没有队色时的兜底） */
+  stroke-dasharray: 5 4; opacity: .9;
+}
+.ring-node {
+  position: absolute; left: 50%; top: 50%;
+  /* 【v0.37】名字(编号) 比原来长不少 → 节点加宽到 96px，并允许名字折行（最多 2 行），
+     不再一超长就吞成省略号。宽度是偶数，居中位移正好取一半。 */
+  width: 96px; margin: -18px 0 0 -48px;    /* 居中对到圆心 */
+  text-align: center; line-height: 1.25;
+  padding: 3px 4px; border-radius: 10px;
+  background: var(--card); border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.ring-node.me { border-color: var(--green); background: var(--card-hi); }
+.ring-node .rn-name {
+  display: block; font-size: 12px; font-weight: 600;
+  /* 【v0.37】不再 nowrap+ellipsis（"player1(1号)"一超宽就变 "player1(1…"）。
+     改成允许折行：优先在括号/空格处断，最长两行后仍超才截。 */
+  white-space: normal; word-break: break-word; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.ring-node .rn-idx { display: block; font-size: 10px; color: var(--gold); }
+
+/* 【v0.36】点环选人：正在问"选谁"时，环上【可点的候选】高亮 + 手型光标。
+   ★ 不可点的（自己 / 不在候选里的）保持素净 —— 让人一眼看出"这一圈里谁能点"。 */
+.ring-node.pickable {
+  cursor: pointer;
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px rgba(212,175,55,.25), var(--shadow);
+}
+.ring-node.pickable:hover { background: var(--card-hi); transform-origin: center; }
+.ring-node.pickable:active { filter: brightness(.94); }
+
+/* ---------- 【v0.22】房主控制台（host.html）
+   和网页客户端共用同一套面板 / 卡片样式，这里只补控制台独有的几块：
+   参数表单一行四项、房间状态徽标配色。 */
+.host-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.host-grid .field { margin-bottom: 0; }
+.host-grid .field input:disabled { opacity: .5; cursor: default; }
+
+/* 房间状态：未开局（灰）/ 等人（蓝）/ 对局中（绿）/ 结束（金） */
+.chip.state-waiting { color: var(--water); border-color: #2b4d63; }
+.chip.state-playing { color: var(--green); border-color: var(--green-dim); }
+.chip.state-ended { color: var(--gold); border-color: #6b5a2a; }
+
+/* 控制台的画面更窄（一栏到底），战报给高一点 */
+#logwrap #log { max-height: 420px; }
+
+/* ---------- 【v0.59】本地试玩台（lab.html / playtest.py）
+   一个配置页 + 一张座位表。座位表要一眼看出"几号位、谁、页面在哪、连没连上"，
+   所以每行平铺，不做卡片。 */
+.seat-list { display: flex; flex-direction: column; gap: 6px; }
+.seat-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 8px;
+  background: var(--card); border: 1px solid var(--line);
+  font-size: 13px;
+}
+.seat-row .seat-no {
+  flex: none; width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--card-hi); border: 1px solid var(--line);
+  color: var(--gold); font-size: 12px;
+}
+.seat-row b { color: var(--text); font-weight: 500; min-width: 60px; }
+.seat-row .seat-url {
+  color: var(--green); font-family: Consolas, Menlo, monospace;
+  font-size: 12px; text-decoration: none; margin-left: auto;
+}
+.seat-row .seat-url:hover { text-decoration: underline; }
+.seat-row .seat-state { flex: none; font-size: 12px; }
+.seat-row .seat-state.on { color: var(--green); }
+.seat-row .seat-state.off { color: var(--text-dim); }
+
+
+
+/* ==========================================================
+   【v0.62】队友链可视化
+   一处定义、三处复用：存活环节点（.rn-team / 连线）、环下图例（.rl-item）、
+   玩家卡与候选卡徽标（.tbadge）。队伍颜色由 JS 按 teams 顺序分配，
+   通过 CSS 变量 --tc 传进来 —— 这里不写死任何颜色，也不判断谁跟谁一队。
+   ========================================================== */
+.tbadge {
+  display: inline-block; margin-left: 5px; padding: 0 5px;
+  border-radius: 6px; font-size: 11px; line-height: 15px;
+  vertical-align: middle; white-space: nowrap;
+  color: var(--tc, var(--gold)); border: 1px solid var(--tc, var(--gold));
+  opacity: .95;
+}
+/* 同队 = 实心（这是玩家最需要一眼看见的那一条） */
+.tbadge.same { background: var(--tc, var(--gold)); color: #121815; font-weight: 700; }
+.ring-node.teamed { border-width: 2px; }
+.rn-team {
+  display: block; font-size: 10px; line-height: 12px;
+  color: var(--tc, var(--gold)); letter-spacing: .5px;
+}
+.ring-legend {
+  display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; align-items: center;
+  padding: 0 6px 6px; font-size: 12px; color: var(--text-dim);
+}
+.ring-legend .rl-item {
+  padding: 1px 8px; border-radius: 9px;
+  border: 1px solid var(--tc, var(--gold)); color: var(--tc, var(--gold));
+}
+/* 【v0.57】勾取：按植物名分组 */
+.tgroup { margin-top: 8px; }
+.tgroup-head {
+  font-size: 12px; color: var(--text); opacity: .85;
+  margin: 0 0 4px; padding-left: 2px;
+}
+.tgroup-head .tgroup-n { margin-left: 6px; color: var(--text-dim); font-size: 11px; }
+.tgroup.lack .tgroup-head { opacity: .5; }
+
+
+/* ==========================================================
+   【v0.63】界面三处修补
+   ① 输赢：大字 + 红绿区分（"你赢了/你输了"是一等信息，谁赢是二等的）
+   ② 等待期也要看得见自己（.mysum：我的植物 / 生命 / 种子 / 各种状态）
+   ③ 角色卡补一个血量数字（光有几颗小方块读不出精确值）
+   ========================================================== */
+.over .big { font-size: 26px; font-weight: 700; letter-spacing: 3px; }
+.over.win .big  { color: var(--green); }
+.over.lose .big { color: var(--danger); }
+.over.draw .big { color: var(--text-dim); letter-spacing: 2px; }
+.over .sub.dim { opacity: .7; font-size: 12px; margin-bottom: 10px; }
+
+.mysum {
+  margin-top: 6px; padding: 8px 10px; border-radius: 10px;
+  background: var(--card); border: 1px solid var(--line);
+  font-size: 12px; color: var(--text-dim);
+}
+.mysum .ms-row { display: flex; gap: 8px; align-items: baseline; line-height: 1.9; flex-wrap: wrap; }
+.mysum .ms-k { flex: none; width: 4.5em; opacity: .8; }
+.mysum b { color: var(--text); }
+.mysum .ms-warn { color: var(--danger); }
+.mysum .ms-dim { opacity: .6; }
+.mysum .ms-super { color: var(--superdef); }
+.mysum .ms-immune { color: var(--immune); }
+
+.stat.hp-num b { color: var(--danger); }

@@ -1,0 +1,6 @@
+# 统一换行符：仓库里存 LF，Windows 检出转 CRLF
+* text=auto
+*.py  text
+*.md  text
+# bat 是 GBK + CRLF，必须原样存取（-text = 当二进制）
+*.bat -text

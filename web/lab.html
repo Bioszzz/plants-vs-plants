@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>植物斗争 · 本地试玩台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <h1>本地试玩台</h1>
+    </div>
+    <div class="meta">
+      <span id="state-chip" class="chip">未开局</span>
+      <span id="cfg-chip" class="chip">—</span>
+    </div>
+  </header>
+
+  <!-- 开局设置：这里配的东西 = 开房间要指定的一切。
+       ★ 规则勾选框由 lab.js 按服务端下发的 rule_options【动态生成】，
+         加一条规则只改 plants_data.RULE_OPTIONS，这个页面不用动。 -->
+  <section id="setup" class="panel">
+    <div class="panel-title">开局设置（全是真人，每个座位一个网页）</div>
+    <div class="host-grid">
+      <label class="field">
+        <span>人数（含电脑）</span>
+        <input id="f-total" type="number" min="2" max="9" value="3" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>其中电脑数</span>
+        <input id="f-bots" type="number" min="0" value="0" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>开局种子（每人）</span>
+        <input id="f-seeds" type="number" min="0" value="0" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>游戏端口（0=自动）</span>
+        <input id="f-port" type="number" min="0" max="65535" value="0" inputmode="numeric">
+      </label>
+    </div>
+
+    <div class="panel-title" style="margin-top:12px">座位名字（真人座位，顺序 = 座位号）</div>
+    <div id="f-names" class="host-grid"></div>
+
+    <div class="panel-title" style="margin-top:12px">房间规则（可选）</div>
+    <div id="f-rules" class="host-grid"></div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="btn-start" class="btn primary">一键开局（开 N 个网页）</button>
+      <button id="btn-open" class="btn" disabled>重新打开座位页</button>
+      <button id="btn-stop" class="btn danger" disabled>停止</button>
+    </div>
+    <div id="err" class="err"></div>
+    <div class="tip">
+      点「一键开局」后：服务端在本进程里起好 → 每个真人座位各自一个真正的网页客户端
+      （独立端口，协议与手动跑 <code>webui.py</code> 完全一致）→ 自动打开 N 个标签。<br>
+      你在这 N 个标签之间切换就是 N 个真人。★ 座位页里的「本机开一局」被禁用，
+      换参数请回这个页面重新开局。
+    </div>
+  </section>
+
+  <section id="seatpanel" class="panel">
+    <div class="panel-title">座位</div>
+    <div id="seats" class="seat-list"></div>
+  </section>
+
+  <section id="logwrap" class="panel">
+    <div class="panel-title">战报（与房主控制台同一份）</div>
+    <div id="log"></div>
+  </section>
+
+</div>
+<script src="lab.js"></script>
+</body>
+</html>
