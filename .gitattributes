@@ -4,3 +4,10 @@
 *.md  text
 # bat 是 GBK + CRLF，必须原样存取（-text = 当二进制）
 *.bat -text
+# 【v0.74】sh 反过来：必须 LF。CRLF 的 shell 脚本在 Linux / Termux 上一跑就报
+#   "bad interpreter" / "$'\r': command not found"。
+#   ★ 加这条之前：`* text=auto` + 本机 core.autocrlf=true → 公开库 clone 到
+#     Windows 上，.sh 会被检出成 CRLF（blob 本身是对的，是检出时转的）；
+#     在 PC 上 clone 再拷进手机就会踩。主仓库 .gitattributes 早就有这条，
+#     但公开库这份是【另写】的模板，所以两边都要加。
+*.sh  text eol=lf
