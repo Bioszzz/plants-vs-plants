@@ -23,6 +23,17 @@
 
 端口：网页客户端 8000 起、房主控制台 8090 起、试玩台配置页 8300 起，被占用会自动往后找。
 
+> **非 Windows（Linux / Android Termux）**：`.bat` 一个都跑不了 —— 那是 cmd.exe 的脚本语言。
+> 试玩台和检查更新各有一个等价脚本：
+>
+> ```sh
+> sh 多开试玩台.sh     # = python playtest.py
+> sh 检查更新.sh       # = python updater.py
+> ```
+>
+> 网页版与房主控制台没有对应 `.sh`，直接 `python webui.py` / `python netserver.py`。
+> ⚠️ 试玩台只监听 `127.0.0.1`，所以手机上必须**跑在手机自己身上**；跨设备联机走 `netserver.py`。
+
 ---
 
 ## 二、手动运行

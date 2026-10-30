@@ -20,6 +20,12 @@
   --gold: #d9b45b;
   --radius: 12px;
   --shadow: 0 4px 14px rgba(0, 0, 0, .35);
+  /* 【v0.74】存活环的尺寸改成变量 —— 窄屏（手机）在文件末尾的 @media 里覆盖。
+     ★ 以前 340/96 是写死在 .ring-circle / .ring-node 里的，app.js 又硬编码
+       半径 R=112 去算节点坐标，三处对不上就没法缩小。现在 JS 只读这两个变量
+       算半径（见 app.js 的 ringMetrics），所以「缩环」只改 CSS 一处。 */
+  --ring-size: 340px;
+  --ring-node: 96px;
 }
 
 * { box-sizing: border-box; }
@@ -30,6 +36,10 @@ body {
   color: var(--text);
   font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* 【v0.74】触屏两件事：点按不要闪一块灰底；去掉双击缩放带来的 300ms 延迟。
+     （viewport 已经是 width=device-width,所以禁掉双击缩放不会妨碍阅读） */
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 #app {
@@ -40,6 +50,10 @@ body {
   flex-direction: column;
   gap: 12px;
   min-height: 100vh;
+  /* 【v0.74】手机浏览器地址栏收起/展开会让 100vh 与实际可视高度差一截，
+     底部那 60px 于是永远要滚一下才看得见。dvh 跟的是「当前可视高度」。
+     不认识 dvh 的浏览器保留上一行的 100vh（回退顺序不能反）。 */
+  min-height: 100dvh;
 }
 
 /* ---------- 顶栏 ---------- */
@@ -497,7 +511,7 @@ body {
 .ring-circle {
   /* 【v0.37】节点从 62px 加宽到 96px → 圈同步放大，免得邻居互相压住。
      【v0.45】用户："最好把存活环做得大一点" → 260 → 340（半径 78 → 112）。 */
-  position: relative; width: 340px; height: 340px;
+  position: relative; width: var(--ring-size); height: var(--ring-size);
   border-radius: 50%;
   border: 1px dashed var(--line);         /* 虚线圈 = "环"本身 */
   background: radial-gradient(circle, rgba(94,194,122,.06), transparent 70%);
@@ -518,7 +532,8 @@ body {
   position: absolute; left: 50%; top: 50%;
   /* 【v0.37】名字(编号) 比原来长不少 → 节点加宽到 96px，并允许名字折行（最多 2 行），
      不再一超长就吞成省略号。宽度是偶数，居中位移正好取一半。 */
-  width: 96px; margin: -18px 0 0 -48px;    /* 居中对到圆心 */
+  width: var(--ring-node);
+  margin: -18px 0 0 calc(var(--ring-node) / -2);   /* 居中对到圆心 */
   text-align: center; line-height: 1.25;
   padding: 3px 4px; border-radius: 10px;
   background: var(--card); border: 1px solid var(--line);
@@ -658,3 +673,67 @@ body {
 .mysum .ms-immune { color: var(--immune); }
 
 .stat.hp-num b { color: var(--danger); }
+
+
+/* ==========================================================
+   【v0.74】手机 / 窄屏适配
+   ★ 这套界面是按 1080px 的桌面窗口排的。搬到手机上要动的不是配色，而是
+     四件具体的事 ——
+       ① 存活环直径 340px 会把一屏撑满 → 缩到 252px（--ring-size，半径由
+          app.js 的 ringMetrics() 读同一个变量算出来，两边不会再对不上）
+       ② 可滚动容器写死 220/300px 高 → 换 vh，让「战报 / 选牌」各分到该有的份额
+       ③ 13px 字 + 10px 内边距的按钮，手指点不准 → 触控目标加高
+       ④ iOS 对字号 < 16px 的输入框会【把整页放大】→ 表单一律 16px
+   ★ 断点取 560px：再宽就该用桌面布局（平板横屏仍是桌面版）。
+   ========================================================== */
+@media (max-width: 560px) {
+  :root { --ring-size: 252px; --ring-node: 76px; }
+
+  #app {
+    /* 四边都让开安全区：viewport-fit=cover 之后，横屏的刘海会压住左/右键，
+       全屏（加到主屏）时状态栏会压住顶栏。 */
+    padding: calc(10px + env(safe-area-inset-top))
+             calc(10px + env(safe-area-inset-right))
+             calc(10px + env(safe-area-inset-bottom))
+             calc(10px + env(safe-area-inset-left));
+    gap: 10px;
+  }
+  /* 顶栏的胶囊在手机上会挤成两行 —— 让它自己换行，别溢出到屏幕外 */
+  #topbar { flex-wrap: wrap; gap: 6px; }
+  #topbar .meta { flex-wrap: wrap; gap: 6px; }
+  #topbar h1 { font-size: 16px; letter-spacing: 1px; }
+
+  /* 环：节点变窄后名字要小一档，垂直居中偏移也少 2px（-18 → -16） */
+  .ring-node { margin-top: -16px; }
+  .ring-node .rn-name { font-size: 11px; }
+
+  /* 战报与选牌：按屏高百分比分，不再写死 220 / 300px */
+  #log { max-height: 34vh; }
+  #logwrap #log { max-height: 34vh; }
+  .picker { max-height: 46vh; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); }
+  .pick { padding: 8px; }
+  .tcard { min-width: 108px; padding: 10px 12px; }
+
+  .btn { padding: 12px 18px; }
+  .chip { padding: 5px 10px; }
+
+  /* iOS 焦点放大：这一条不能省，否则手指一点输入框，整页就被缩放过去 */
+  .field input, .pk-search input, .numrow input, .local-row input { font-size: 16px; }
+
+  /* 试玩台座位表：一行放不下「号 + 名字 + 状态 + 链接」→ 链接掉到第二行 */
+  .seat-row { flex-wrap: wrap; row-gap: 2px; }
+  .seat-row .seat-url { margin-left: 0; width: 100%; word-break: break-all; }
+  .host-grid { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+
+  /* 浮层别顶到屏幕边（320px 固定宽在 375px 屏上几乎贴满） */
+  #ptip { width: auto; min-width: 240px; max-width: calc(100vw - 20px); }
+}
+
+/* 触屏没有「悬停」这回事：手指抬起后 :hover 会【粘住】，
+   卡片会一直保持「抬起 2px + 高亮」，看起来像已经选中了。 */
+@media (hover: none) {
+  .pick:hover:not(:disabled),
+  .tcard:hover:not(:disabled),
+  .btn:hover:not(:disabled),
+  .ring-node.pickable:hover { transform: none; }
+}

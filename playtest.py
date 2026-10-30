@@ -310,15 +310,35 @@ class Lab:
 # ======================================================================
 #  打开标签页
 # ======================================================================
+def _open_tab(url):
+    """试一下真的能调起浏览器 —— 返回 True/False，绝不抛异常。
+
+    ★ 为什么不能直接 webbrowser.open 就完事：在 Termux（手机）和任何无桌面
+      环境里，webbrowser.open 是【静默失败】—— 返回 False，也不抛异常。
+      用户那边看到的就是"点了开局，一个标签都没开"，还以为程序坏了。
+      所以这里把返回值收上来，没人开得出来就改成打印可点的链接。"""
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
+
+
 def open_seat_tabs(seats):
     """依次打开座位页。★ 中间要 sleep：连续调 webbrowser.open 时，某些浏览器
-    会把后几次合并成一个标签（用户看起来就是"只开了 1 个页"）。"""
+    会把后几次合并成一个标签（用户看起来就是"只开了 1 个页"）。
+
+    【v0.74】返回成功打开的数量；一个都没打开（手机 Termux / 无桌面）时
+    打印一句"去页面上点座位链接"，否则整件事就是静默无声的。"""
+    opened = 0
     for s in seats:
-        try:
-            webbrowser.open(s.url())
-        except Exception:
-            pass
+        if _open_tab(s.url()):
+            opened += 1
         time.sleep(0.45)
+    if seats and not opened:
+        print("\n[提示] 没能自动打开浏览器（手机 / 无桌面环境都这样）。")
+        print("       请在试玩台页面的「座位」表里点链接 —— 每个座位一行，")
+        print("       点开就是一个独立标签页，一个标签 = 一个真人。")
+    return opened
 
 
 # ======================================================================
@@ -522,10 +542,15 @@ def main():
     print("  · 在这里配 人数 / 电脑数 / 种子 / 端口 / 规则，点「一键开局」。")
     print("  · 每个真人座位会开一个独立的网页客户端（端口从 %d 起），"
           "全是真人 = 全是你在不同标签里操作。" % SEAT_PORT_BASE)
+    print("  · 手机（Termux）：浏览器打不开标签是正常的 —— "
+          "在页面的「座位」表里点链接，一个标签一个真人。")
     print("  · Ctrl+C 退出。")
 
     if opt["browser"]:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+        def _open_lab():
+            if not _open_tab(url):
+                print("[提示] 浏览器没能自动打开，请手动访问上面的地址。")
+        threading.Timer(0.4, _open_lab).start()
 
     try:
         httpd.serve_forever()

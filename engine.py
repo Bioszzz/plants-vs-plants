@@ -516,6 +516,10 @@ class FieldPlant:
         #     （照常结算，只是支配权归勾取者）。
         self.form = ""
         self.hooked_by = None
+        # 【v0.74】被谁[废除]的（刀类那一株的**玩家**）—— 163 火西瓜要"不烧废除者"。
+        #   只有刀类的 [消除]/[废除] 会填它；[毁灭]（黑洞）与勾取一律留 None，
+        #   这是用户 2026-10-30 明确的口径："不包括黑洞，但是刀叶类和榴莲的都是"。
+        self.gone_by = None
         # 【v0.72】hollow = 被[勾取]成[空]（原稿 p09"被夺走目标成[空]"）。
         #   ★ 与 inert 的关系：涉及"成[空] 还出不出手"的三条口径打架
         #     （p30 的"0防0暴" / 3928 行"彻底作废不出手" / 16.12"被勾者照常结算"），
@@ -542,7 +546,7 @@ class FieldPlant:
         self.bao = 0          # 【v0.30】暴击同样归零（与 fang 对称）
         self.inert = True
 
-    def to_empty(self):
+    def to_empty(self, by=None):
         """【v0.32】被"切"成 [空]：防御、暴击全归零、一切效果失效，但人还在。
 
         与 stand_down() 的区别：stand_down 是"玩家自己选择不释放"，
@@ -554,6 +558,8 @@ class FieldPlant:
         self.bao = 0
         self.cut_gone = True
         self.inert = True
+        # 【v0.74】记下"是谁废的"（Player）。只有刀类会传；[毁灭] 传 None。
+        self.gone_by = by
 
 
 class Player:
@@ -2235,7 +2241,9 @@ class Game:
                 continue
             if atk.lian > 1:
                 bursters.append(p)
-            elif atk.san > 1 and len(self.others_alive(p)) > 1:
+            # 【v0.74】163 火西瓜：群攻（group_all）走多目标题。
+            elif (atk.san > 1 or getattr(p.field.spec, "group_all", False)) \
+                    and len(self.others_alive(p)) > 1:
                 spreaders.append(p)
             else:
                 shooters.append(p)
@@ -2615,7 +2623,7 @@ class Game:
     # ==================================================================
     # 【v0.32】刀叶类（消除 / 废除）—— 结算
     # ==================================================================
-    def _void_one(self, target, why):
+    def _void_one(self, target, why, by=None):
         """把一株植物打成[空]并让它的这一回合【彻底作废】——
         [消除] / [废除] / [毁灭] 三条路径共用的唯一落地口。
 
@@ -2627,7 +2635,7 @@ class Game:
         """
         if target.field is None or target.field.spec is EMPTY:
             return False
-        target.field.to_empty()
+        target.field.to_empty(by)
         self.released.discard(target)
         self.plans.pop(target, None)
         self.cut_plans.pop(target, None)
@@ -2876,7 +2884,9 @@ class Game:
         #   两者【效果相同】（成[空]），差别只在来源与"免切①/②"各挡谁 ——
         #   所以这里只改措辞，效果仍然走同一个 _void_one。
         verb = "废除" if is_durian(p.field.spec) else "消除"
-        self._void_one(target, verb)
+        # 【v0.74】把"谁废的"记到目标身上（163 火西瓜要据此不烧废除者）。
+        #   ★ 传支配者：这一株若已被[勾取]，出手的是支配者 —— 与收益归属同一条规则。
+        self._void_one(target, verb, by=self._holder(p))
         self.say("  ◆ %s 的【%s】%s %s 的【%s】→ 成[空]（防御、暴击归零；人还在）"
                  % (p.tag, p.field.spec.name, verb, target.tag, tspec.name))
         # 【v0.33 修】★ 成[空] = 这一株在本回合【彻底作废】，不只是数值归零 ——
@@ -3671,6 +3681,8 @@ class Game:
             return "assist"
         if getattr(s, "super_def", 0) or getattr(s, "immune_turns", 0):
             return "defense"
+        if getattr(s, "mass_def_down", 0):
+            return "massdef"
         if getattr(s, "fire_gain", 0):
             return "fire"
         if getattr(s, "mult_gain", 0) or getattr(s, "fishy_gain", 0):
@@ -3886,7 +3898,9 @@ class Game:
             if atk.lian > 1:
                 q = self._q_burst_split(owner, cands, atk.lian, by=hooker, cond=True)
                 items.append((owner, hooker, "burst", q))
-            elif atk.san > 1 and len(cands) > 1:
+            # 【v0.74】163 火西瓜：群攻（group_all）也走多目标题，和散连击共用同一个 kind。
+            elif (atk.san > 1 or getattr(owner.field.spec, "group_all", False)) \
+                    and len(cands) > 1:
                 items.append((owner, hooker, "spread",
                               self._q_targets(owner, by=hooker, cands=cands, cond=True)))
             else:
@@ -4124,7 +4138,9 @@ class Game:
                 qs.append(self._q_burst_split(f.player, cands, atk.lian,
                                               by=answerer, cond=True, verb="聚电"))
                 kinds.append("burst")
-            elif atk.san > 1 and len(cands) > 1:
+            # 【v0.74】163 火西瓜：群攻（group_all）也走多目标题，和散连击共用同一个 kind。
+            elif (atk.san > 1 or getattr(f.player.field.spec, "group_all", False)) \
+                    and len(cands) > 1:
                 qs.append(self._q_targets(f.player, by=answerer, cands=cands,
                                           cond=True, verb="聚电"))
                 kinds.append("spread")
@@ -4748,15 +4764,54 @@ class Game:
                     if refreshed:
                         self.say("  → 已有[免疫] → 【刷新】为 %d 回合（不叠加）"
                                  % spec.immune_turns)
-        elif kind == "fire":
+        elif kind == "massdef":
+            # 【v0.74】163 火西瓜：释放成功即全场（除自己）防御 −N，【不可选】。
+            #   ★ 会连队友一起削 —— 用户明确："你有可能会害死自己的队友"。
             for p in self._appliers():
                 spec = p.field.spec
-                if not spec.fire_gain:
+                n = getattr(spec, "mass_def_down", 0)
+                if not n:
                     continue
                 for other in self.players:
                     if other is p or not other.alive:
                         continue
-                    self._add_fire(other, spec.fire_gain)
+                    if other.field is None or other.field.spec is EMPTY:
+                        continue
+                    other.field.fang -= n
+                    self.say("  ◆ %s 的【%s】→ %s 的【%s】防御 −%d（现有%d）"
+                             % (p.tag, spec.name, other.tag,
+                                other.field.spec.name, n, other.field.fang))
+        elif kind == "fire":
+            # 【v0.74】163 火西瓜：被【刀类】废除时火种改 +3，且【不烧废除者】。
+            #   ★★ 它被废除后已经从 released 里摘掉了（_appliers 就看不见它），
+            #      但用户 2026-10-30 明确要求"被废除之后反而多一个"——
+            #      所以这里要把它【单独捞回来】，不能只遍历 _appliers。
+            crowd = list(self._appliers())
+            for p in self.players:
+                if (p.alive and p.field is not None and p not in crowd
+                        and getattr(p.field, "cut_gone", False)
+                        and getattr(p.field.spec, "fire_gain_if_cut", 0)):
+                    crowd.append(p)
+            for p in crowd:
+                spec = p.field.spec
+                gain = getattr(spec, "fire_gain", 0)
+                skip = None
+                if getattr(spec, "fire_gain_if_cut", 0):
+                    by = getattr(p.field, "gone_by", None)
+                    if by is not None:
+                        gain = spec.fire_gain_if_cut
+                        skip = self._holder(by)
+                        self.say("  ◆ %s 的【%s】被废除 → 火种改 %d 个，"
+                                 "且不烧废除者 %s"
+                                 % (p.tag, spec.name, gain, skip.tag))
+                if not gain:
+                    continue
+                for other in self.players:
+                    if other is p or not other.alive:
+                        continue
+                    if skip is not None and other is skip:
+                        continue
+                    self._add_fire(other, gain)
         elif kind == "layer":
             exempt = self.cut_exempt_plans
             for p in self._appliers():
@@ -5117,7 +5172,10 @@ class Game:
         #     [噬魂]后面。" 噬魂 / 有收益批 也是攻击，所以这三步要更早；
         #     附加层（倍耗 / 鱼腥味）降级为"下回合才入账"，本回合没人读它。
         #   ★ 每一步开头照例先兑 [勾取] 与 [反馈湮灭]（它们对任何一步都成立）。
-        for _stage in ("assist", "defense", "fire", "layer"):
+        # 【v0.74】新增 "massdef"（群体减防，163 火西瓜）——
+        #   ★ 位置：防御收益【之后】、火种 / 噬魂 / 一切攻击【之前】。
+        #     它改的是"有效防御"，而噬魂的门槛和普攻的削防都读这个数，晚一步全错。
+        for _stage in ("assist", "defense", "massdef", "fire", "layer"):
             self._hook_pass(_stage)
             self._feedback_pass(_stage)
             self._apply_effects_phase(_stage)
@@ -5186,7 +5244,14 @@ class Game:
         self._feedback_pass("attack")   # 【v0.58】反馈先于这一步自己的效果判
         normal = [p for p in self.plans
                   if not p.field.spec.attack.is_devour
-                  and not is_reward_class(p.field.spec)]
+                  and not is_reward_class(p.field.spec)
+                  # ★★★【v0.74】134 猫尾草【不在这里打】—— 它走 _resolve_cat_tail
+                  #   （所有攻击之后，按当时存活环重算两侧）。
+                  #   少了这一条，它会先在这里把 lian 发打满，末尾又打一遍 = 双倍。
+                  #   这个洞从 v0.39 引入"猫尾草最后攻击"那天就在：当时只补了
+                  #   "末尾再打一次"，没把它从普通攻击名单里摘掉。用户 2026-10-30
+                  #   报"猫尾草怎么打了六发"才发现 —— 之前没人数过总发数。
+                  and not p.field.spec.nearest_target]
         if normal:
             self.say("—— 普通攻击（按序列优先级）——")
         for p in self._attack_order(normal):
@@ -5494,6 +5559,10 @@ class Game:
             return True
         # 【v0.21】噬魂（吞噬）类：到这里就是"防御还在"，按规则要拿暴值当门槛 ——
         #   暴 > 有效防御 才吞得动；【不削防】。规则见第十二章。
+        # 【v0.74】163 火西瓜：[不破防] —— 暴击不削减防御，改当门槛；
+        #   成立就吃固定伤害（原稿"伤1"），不夺种、不回血。
+        if getattr(attacker.spec, "no_break", False):
+            return self._nobreak_hit(attacker, defender)
         if a.is_devour:
             return self._devour_hit(attacker, defender, bypass=False)
         # 【v0.9】叠暴 diebao 暂不启用：连击的每一发都用 bao 削防。
@@ -5529,6 +5598,35 @@ class Game:
             return False
 
     # ---------- 【v0.21】噬魂（吞噬）类 ----------
+    def _nobreak_hit(self, attacker, defender):
+        """【v0.74】[不破防] 类攻击（163 火西瓜）。
+
+        与噬魂的三点同、两点不同：
+          同：① 不削减防御（对方 fang 一点不动）；② 暴值当【门槛】；③ 先于普攻那套削防。
+          异：① 不夺种、不回血，只有伤害；② 门槛用"暴 > 有效防御"，
+              但有效防御的算法与噬魂完全一致（= fang − fang_aux，水位那边的辅助防不算）。
+        ★ 超防照样拦得住 —— 闸门在 resolve_hit 开头，这里进不来。
+        """
+        a = attacker.spec.attack
+        spec = attacker.spec
+        tgt = defender.player
+        me = attacker.player
+        desc = "%s的【%s】→ %s的【%s】" % (me.tag, spec.name, tgt.tag,
+                                           defender.spec.name)
+        eff = max(0, defender.fang - defender.fang_aux)
+        if a.bao <= eff:
+            self.say("%s：[不破防] 暴%d 压不过有效防御%d%s → 这一发落空"
+                     "（不削防、不掉血）"
+                     % (desc, a.bao, eff,
+                        "（已扣掉辅助防 P₁）" if defender.fang_aux else ""))
+            return False
+        self.say("%s：暴%d > 有效防御%d → [不破防] 直击（对方防御不减）"
+                 % (desc, a.bao, eff))
+        self.say("    → %s" % self._hurt_text(tgt, a.damage, a.super_pierce))
+        self.fire("on_break", defender, {"attacker": attacker})
+        self._dealt_damage(attacker)
+        return True
+
     def _devour_hit(self, attacker, defender, bypass):
         """一次【吞噬】的结算。规则见 游戏规则总结.txt 第十二章。
 
@@ -6346,16 +6444,28 @@ class Game:
         if cands is None:
             cands = self.others_alive(p)
         idxs = {c.idx for c in cands}
-        count = min(max(1, p.field.spec.attack.san), len(cands))
+        # 【v0.74】163 火西瓜：群攻「默认全选、逐个取消」——
+        #   count 报【全部候选】（界面据此把它们全勾上），答案长度 1~N 都合法，
+        #   玩家自己一个个减掉。其余植物（散连击 san）照旧：必须恰好 count 个、
+        #   且互不相同 —— 两者只在 group_all 上分叉，别混。
+        group = bool(getattr(p.field.spec, "group_all", False))
+        count = len(cands) if group else min(max(1, p.field.spec.attack.san),
+                                             len(cands))
 
         def ok(v):
-            return (isinstance(v, list) and len(v) == count
-                    and len(set(v)) == len(v)
-                    and all(isinstance(x, int) and not isinstance(x, bool) and x in idxs
-                            for x in v))
+            if not isinstance(v, list) or len(set(v)) != len(v):
+                return False
+            if not all(isinstance(x, int) and not isinstance(x, bool) and x in idxs
+                       for x in v):
+                return False
+            if group:
+                # 任意多个，但不许一个都不选（全不选等于白放，不如直接不释放）
+                return 1 <= len(v) <= count
+            return len(v) == count
         return Question(
             "targets", by or p, self,
             count=count,
+            default_all=group,
             own={"from": p.tag, "plant": p.field.spec.name,
                  "proxy": self._proxy_label(
                      p, by, "你要让它散连击打哪几个人？", cond=cond,

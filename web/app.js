@@ -39,6 +39,17 @@ let CUR_ASK = null;
 //   （与 v0.60 的图鉴同一类问题：题先到、场面后到，画题时 teams 还是空的）。
 let TEAM_SIG = '';
 
+/* 【v0.74】触屏判定。
+   ★ 为什么要它：这套界面的简介是「悬停浮层」（#ptip），手指没有悬停 ——
+     iOS/Android 上一点卡片，pointerover 和 click 会连着触发，
+     浮层刚冒出来就被"选中"顶掉了，等于手机上永远读不到植物简介。
+     所以触屏改成【长按 420ms 看简介、轻点选中】。
+   ★ 只认 (hover: none)：带触摸屏的笔记本（hover 仍为 hover）继续走悬停，
+     不然那类机器会莫名其妙退化成"必须长按"。
+   ★ 页面加载时求值一次 —— 用 DevTools 切设备模拟后要刷新一次才生效。 */
+const TOUCH = !!(window.matchMedia && window.matchMedia('(hover: none)').matches);
+const TOUCH_HOLD_MS = 420;
+
 /* ================= 【v0.62】队友链可视化 =================
    数据只认引擎 state 的 teams（每个连通分图一组，组内第 0 个 = 代表元）——
    前端【不】自己算"谁跟谁一队"（那是引擎并查集的活），只负责让人一眼看见：
@@ -532,6 +543,19 @@ function renderBoard(st) {
      前端不自己按环的位置算"谁能被打"（那是引擎的事）。
    ★ 未来扩展：节点上已经挂了 data-idx，将来做三国杀那种"环形座位 + 连线/方位"
      只需要改这里的画法，选人协议不用动。 */
+
+/* 【v0.74】环半径 = 容器半径 −（节点半宽 + 10px 余量）。
+   桌面：340/2 − (96/2 + 10) = 112 —— 与 v0.45 写死的 112 完全一致，
+   所以桌面布局一个像素都没动；手机：252/2 − (76/2 + 10) = 76。
+   ★ 唯一的数据源是 style.css 的 --ring-size / --ring-node，
+     窄屏覆盖就在那个 @media 里，前端不用再判断窗口宽度。 */
+function ringRadius() {
+  const cs = getComputedStyle(document.documentElement);
+  const size = parseFloat(cs.getPropertyValue('--ring-size')) || 340;
+  const node = parseFloat(cs.getPropertyValue('--ring-node')) || 96;
+  return Math.max(40, size / 2 - (node / 2 + 10));
+}
+
 function renderRing(st) {
   const wrap = $('ringwrap');
   const box = $('ring');
@@ -556,7 +580,9 @@ function renderRing(st) {
   // 容器是固定大小的圆，节点绝对定位到圆心 + 半径 * (cos, sin)。
   const n = ids.length;
   // 【v0.45】用户："最好把存活环做得大一点" —— 半径 78 → 112（容器同步放大）。
-  const R = 112;                      // 环半径（px）
+  // 【v0.74】半径不再写死：从 CSS 的 --ring-size / --ring-node 反算，
+  //   手机端在 @media 里把环缩到 252px 时，节点坐标自动跟着变。
+  const R = ringRadius();             // 环半径（px）
   const pos = {};                     // idx -> {x, y}（相对圆心）
   let h = '<div class="ring-circle">';
   // 【v0.45】队友链连线层：画在节点【下面】。零尺寸 + overflow:visible，
@@ -785,6 +811,14 @@ function answer(v) {
 function bindPick(sel, ev) {
   document.querySelectorAll(sel).forEach(b => {
     b.onclick = () => {
+      // 【v0.74】触屏长按 = 看简介，这一下【不该】顺手把牌打出去。
+      //   标记由 renderPlant 的长按计时器打上，只吞这一次点击。
+      //   ★ 吞掉但【不收起浮层】：手指一松就收，等于什么也没读到。
+      //     浮层会留着，滚动 / 换题 / 点别的牌时自然消失（hidePlantTip 的既有出口）。
+      if (b.dataset.lp === '1') {
+        delete b.dataset.lp;
+        return;
+      }
       document.querySelectorAll(sel).forEach(x => { x.disabled = true; });
       const raw = b.dataset.v;
       let v = raw;
@@ -830,6 +864,12 @@ function pickOne(sel, idx) {
      同一份数据两个出口，迟早走样）。
    ★ pointer-events:none：浮层不吃鼠标事件，横向扫过一排卡不会闪来闪去。 */
 let PTIP = null;
+/* 【v0.74】触屏「钉住」标志。
+   ★ 手机上的浮层是长按【点开】的，不是鼠标悬停出来的 —— 所以手指一松、
+     页面一动（scroll 事件连捕获阶段都算）都不该把它收掉，否则等于白按。
+     钉住之后由这些事收掉：点空白、换题、卡片重绘（都是强制 hide）。
+   ★ 桌面悬停的浮层【永远不钉住】，行为与 v0.53 完全一致。 */
+let PTIP_PIN = false;
 
 function plantTipEl() {
   if (!PTIP) {
@@ -855,7 +895,7 @@ function plantTipHtml(p) {
     (chips ? '<div class="ptip-chips">' + chips + '</div>' : '') + body;
 }
 
-function showPlantTip(host, p) {
+function showPlantTip(host, p, pin) {
   const t = plantTipEl();
   t.innerHTML = plantTipHtml(p);
   t.style.display = 'block';
@@ -869,15 +909,27 @@ function showPlantTip(host, p) {
   t.style.left = left + 'px';
   t.style.top = top + 'px';
   t.style.visibility = 'visible';
+  PTIP_PIN = !!pin;                       // 【v0.74】长按弹出来的，别被滚动收走
 }
 
-function hidePlantTip() {
+function hidePlantTip(soft) {
+  // soft = 只有"位置失效"这一类（滚动 / 缩放）才这么调；钉住的浮层不理它。
+  if (soft && PTIP_PIN) return;
+  PTIP_PIN = false;
   if (PTIP) PTIP.style.display = 'none';
 }
 
-/* 视口变了、或者任何一层容器滚了 → 浮层位置就失效了，直接收掉（宁可闪一下也别飘着） */
-window.addEventListener('resize', hidePlantTip);
-window.addEventListener('scroll', hidePlantTip, true);
+/* 视口变了、或者任何一层容器滚了 → 浮层位置就失效了，直接收掉（宁可闪一下也别飘着）
+   【v0.74】触屏长按钉住的浮层例外 —— 见 PTIP_PIN。 */
+window.addEventListener('resize', () => hidePlantTip(true));
+window.addEventListener('scroll', () => hidePlantTip(true), true);
+
+/* 【v0.74】触屏：点空白处收掉钉住的浮层（否则它会一直挡着下面两行卡片）。 */
+if (TOUCH) {
+  document.addEventListener('pointerdown', (e) => {
+    if (!e.target.closest('.pick') && !e.target.closest('#ptip')) hidePlantTip();
+  }, true);
+}
 
 function renderPlant(ev) {
   const own = ev.own || {};
@@ -924,17 +976,45 @@ function renderPlant(ev) {
   // 【v0.53】悬停 = 展开简介。
   //   用【事件委托】挂在容器上：搜索框每敲一个字都会重建卡片，逐个绑会重复绑。
   //   键盘 Tab 聚焦也走同一条路（onfocusin），不然纯键盘玩家看不到简介。
-  const tipFor = (el) => {
+  const tipFor = (el, pin) => {
     if (!el || el.disabled) { hidePlantTip(); return; }
     const p = list.find(x => x.name === el.dataset.v);
-    if (p) showPlantTip(el, p); else hidePlantTip();
+    if (p) showPlantTip(el, p, pin); else hidePlantTip();
   };
   const box = $('pk-list');
-  box.onpointerover = (e) => tipFor(e.target.closest('.pick'));
-  box.onpointerleave = hidePlantTip;
+  if (TOUCH) {
+    /* 【v0.74】触屏：长按 420ms 弹简介，轻点照常选牌。
+       为什么不用 pointerover —— 手指一按下它就触发，浮层刚出来就被
+       "选牌"顶掉了（详见文件顶部 TOUCH 的注释）。
+       ★ 位移超过 10px 就当成滚动，取消长按 —— 手指按在卡片上再划走读下方内容
+         是手机上的常见动作，不能因此弹出一个浮层。 */
+    let timer = null, sx = 0, sy = 0;
+    const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    box.onpointerdown = (e) => {
+      const el = e.target.closest('.pick');
+      if (!el || el.disabled) return;
+      cancel();
+      delete el.dataset.lp;            // 上一轮的残留标记先清掉，免得吞掉这次点击
+      sx = e.clientX; sy = e.clientY;
+      timer = setTimeout(() => {
+        timer = null;
+        el.dataset.lp = '1';           // 告诉 bindPick：这一下是看简介，不是出牌
+        tipFor(el, true);              // pin=true：松手 / 页面微动都不收起
+      }, TOUCH_HOLD_MS);
+    };
+    box.onpointerup = cancel;
+    box.onpointercancel = cancel;
+    box.onpointermove = (e) => {
+      if (timer && (Math.abs(e.clientX - sx) > 10 || Math.abs(e.clientY - sy) > 10)) cancel();
+    };
+    box.onpointerleave = () => { cancel(); hidePlantTip(true); };
+  } else {
+    box.onpointerover = (e) => tipFor(e.target.closest('.pick'));
+    box.onpointerleave = () => hidePlantTip();
+  }
   box.onfocusin = (e) => tipFor(e.target.closest('.pick'));
-  box.onfocusout = hidePlantTip;
-  box.onscroll = hidePlantTip;
+  box.onfocusout = () => hidePlantTip();
+  box.onscroll = () => hidePlantTip(true);
 
   render();
 }
@@ -1048,30 +1128,42 @@ function renderTarget(ev) {
 
 function renderTargets(ev) {
   const need = ev.count;
-  const picked = [];
+  // 【v0.74】163 火西瓜：群攻走同一个 kind，但语义是"默认全选、逐个取消"。
+  //   · default_all = true → 一开始就全勾上，点谁取消谁，至少留 1 个；
+  //   · 其余（散连击）照旧：必须恰好选 need 个。
+  const all = !!ev.default_all;
+  const picked = all ? ev.cands.map(c => c.idx) : [];
   const own = ev.own || {};
+  const tip = all
+    ? '群攻：默认【全场所有人】，点谁就取消谁（至少留 1 个）'
+    : '散连击：选 ' + need + ' 个【不同】的目标，每人挨 1 下';
   let h = qfrom(own) + qproxy(own) +
-    '<div class="qtip">散连击：选 ' + need + ' 个【不同】的目标，每人挨 1 下</div>' +
-    '<div class="qsub">已选 <b id="cnt">0</b>/' + need + '</div><div class="targets">';
+    '<div class="qtip">' + tip + '</div>' +
+    '<div class="qsub">已选 <b id="cnt">' + picked.length + '</b>/' + need +
+    (all ? '（默认全选）' : '') + '</div><div class="targets">';
   ev.cands.forEach(c => {
-    h += '<button class="tcard" data-v="' + c.idx + '">' +
+    const sel = all ? ' sel' : '';
+    h += '<button class="tcard' + sel + '" data-v="' + c.idx + '">' +
       '<div class="t-name">' + (c.name_tag || c.name) + '</div>' +
       '<div class="t-sub">' + targetSub(c) + '</div></button>';
   });
   h += '</div><div class="row" style="margin-top:10px">' +
-    '<button class="btn primary" id="ok" disabled>确定</button></div>';
+    '<button class="btn primary" id="ok">确定</button></div>';
   setDeck(h);
+  $('ok').disabled = all ? picked.length < 1 : picked.length !== need;
   document.querySelectorAll('.tcard').forEach(b => {
     b.onclick = () => {
       const v = parseInt(b.dataset.v, 10);
       const i = picked.indexOf(v);
-      if (i >= 0) { picked.splice(i, 1); b.classList.remove('sel'); }
-      else {
+      if (i >= 0) {
+        if (all && picked.length <= 1) return;   // 群攻至少留 1 个
+        picked.splice(i, 1); b.classList.remove('sel');
+      } else {
         if (picked.length >= need) return;
         picked.push(v); b.classList.add('sel');
       }
       $('cnt').textContent = picked.length;
-      $('ok').disabled = picked.length !== need;
+      $('ok').disabled = all ? picked.length < 1 : picked.length !== need;
     };
   });
   $('ok').onclick = () => {
