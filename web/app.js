@@ -1907,32 +1907,89 @@ function renderFlash(ev) {
 
 function renderCatSplit(ev) {
   // 【v0.39】猫尾草：连击 shots 发分配到左右两侧 → 答案 [左发数, 右发数]
+  //
+  // ★★【v0.74.1】旧版把右侧写成一行**死文字**"（自动补足 = shots − 左侧）"：
+  //   屏幕上只有左边那个输入框能改，右边看着像"不许选"。玩家的原话是
+  //   "不应该锁死其中一边的选择，自动计算应该体现成动一边另一边自动加减"。
+  //   → 现在两侧都是 −/数字/＋ 三件套，改哪边另一边自动补，合计恒 = shots
+  //     （与服务端 `_q_cat_split` 的 `_valid`：a+b == n 是同一个约束）。
+  //   ★ 为什么不像 renderBurstSplit 那样"每人一个输入、自己去凑合计"：
+  //     猫尾草只有两侧、总数是死的（凑不合就不让确定），加校验只会添乱。
+  //     这里唯一的自由度就是"左侧几发"，右侧是它的镜像。
   const shots = ev.shots || 1;
   const L = ev.left || {}, R = ev.right || {};
   const own = ev.own || {};
   let h = qfrom(own) + qproxy(own) +
     '<div class="qtip">【' + (ev.plant || '猫尾草') + '】连击 ' + shots +
     ' 发 → 存活环上离你最近的是左右这两个，请分配各打几发：' +
-    '<span class="qsub">（左右合计 = ' + shots + '）</span></div>' +
-    '<div class="row" style="gap:16px">' +
-    '<div><div class="t-name">左：' + (L.name_tag || L.name || '?') + '</div>' +
-    '<input type="number" id="cat-left" min="0" max="' + shots +
-    '" value="' + shots + '" style="width:70px"></div>' +
-    '<div><div class="t-name">右：' + (R.name_tag || R.name || '?') + '</div>' +
-    '<div class="t-sub">（自动补足 = ' + shots + ' − 左侧）</div></div>' +
-    '</div>';
-  h += '<div class="row" style="margin-top:10px">' +
-    '<button class="btn" id="cat-ok">确定</button></div>';
+    '<span class="qsub">（改一边，另一边自动加减；合计恒为 ' + shots +
+    '；点存活环上的目标 = 从另一边挪 1 发过来）</span></div>' +
+    '<div class="targets">';
+  [{ c: L, side: 'left', label: '左' },
+   { c: R, side: 'right', label: '右' }].forEach(x => {
+    h += '<div class="tcard burst cat" data-side="' + x.side + '">' +
+      '<div class="t-name">' + x.label + '：' +
+      (x.c.name_tag || x.c.name || '?') + '</div>' +
+      '<div class="t-sub">' + targetSub(x.c) + '</div>' +
+      '<div class="alloc">' +
+      '<button class="mini" data-cat="-" data-side="' + x.side + '">−</button>' +
+      '<input class="cnt" type="number" min="0" max="' + shots +
+      '" data-side="' + x.side + '">' +
+      '<button class="mini" data-cat="+" data-side="' + x.side + '">＋</button>' +
+      '</div></div>';
+  });
+  h += '</div><div class="row" style="margin-top:10px">' +
+    '<button class="btn primary" id="cat-ok">确定</button></div>';
   setDeck(h);
-  // 环上点亮左右两侧，点了也能改左侧发数（点左侧=把剩余全给左；简单起见：点击切换）
+
+  const ins = {};
+  document.querySelectorAll('.tcard.cat .cnt').forEach(inp => {
+    ins[inp.dataset.side] = inp;
+  });
+  // 模型：只存"左侧发数"，右边永远是 shots − 它。DOM 只是它的投影，
+  // 这样不管玩家怎么乱敲，送出去的答案一定满足 a+b == shots。
+  let lc = shots;
+  const clamp = v => Math.max(0, Math.min(shots, v));
+  function paint() {
+    if (ins.left) ins.left.value = lc;
+    if (ins.right) ins.right.value = shots - lc;
+  }
+  function setLeft(v) {
+    const n = parseInt(v, 10);
+    if (isNaN(n)) return;          // 空框 / 半个负号：先不动另一边，等 blur
+    lc = clamp(n);
+    paint();
+  }
+  paint();
+
+  Object.keys(ins).forEach(side => {
+    // 输入过程中也夹住：宁可当场跳到合法值，也不让框里出现 9（shots 才 3）
+    ins[side].oninput = () => {
+      const v = parseInt(ins[side].value, 10);
+      if (isNaN(v)) return;        // 空框：先不动另一边，等玩家打完
+      lc = (side === 'left') ? clamp(v) : shots - clamp(v);
+      paint();
+    };
+    ins[side].onchange = () => {
+      const v = parseInt(ins[side].value, 10);
+      lc = (side === 'left') ? clamp(isNaN(v) ? 0 : v)
+                             : shots - clamp(isNaN(v) ? 0 : v);
+      paint();
+    };
+  });
+  document.querySelectorAll('.mini[data-cat]').forEach(b => {
+    b.onclick = () => {
+      // 左侧 +1 = lc+1；右侧 +1 = lc−1（右侧多一发 = 左侧少一发）
+      const plus = (b.dataset.cat === '+');
+      const isLeft = (b.dataset.side === 'left');
+      setLeft(lc + ((plus === isLeft) ? 1 : -1));
+    };
+  });
+  // 点存活环 = 从另一边挪 1 发过来（合计不变，所以不是"越点越多"）
   setRingPick([L.idx, R.idx].filter(x => x !== undefined && x !== null), idx => {
-    const el = document.getElementById('cat-left');
-    if (el) el.value = (idx === L.idx) ? shots : 0;
+    setLeft(lc + (idx === L.idx ? 1 : -1));
   });
   document.getElementById('cat-ok').onclick = () => {
-    let lc = parseInt(document.getElementById('cat-left').value, 10);
-    if (isNaN(lc) || lc < 0) lc = 0;
-    if (lc > shots) lc = shots;
     document.getElementById('cat-ok').disabled = true;
     answer([lc, shots - lc]);
   };

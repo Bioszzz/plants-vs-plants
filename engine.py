@@ -1143,6 +1143,25 @@ class Game:
         """
         return self.ring.neighbors(target, exclude)
 
+    def nearest_sides(self, p):
+        """【v0.74.1】134 猫尾草专用的"最近两侧"。
+
+        ★★ 为什么不能直接用 ring_neighbors：那个函数里的
+          `len(members) < 3 → return []` 是给【溅射】定的规则
+          （用户 2026-09-21"没有两侧就不触发"）。猫尾草的判据是原稿那句
+          **"目标只能是最靠近自己的仍有活着者"** —— 1v1 里对手就是
+          "最靠近自己的那个活人"，必须打（用户 2026-11-04 拍板）。
+        ★ 环上只剩 2 人（我和对手）→ 返回那唯一一个；环上只有我自己 → 空表。
+        ★ 溅射仍然走 ring_neighbors，**不动它的"不足 3 人不触发"**。
+        """
+        sides = self.ring_neighbors(p, exclude=p)
+        if sides:
+            return sides
+        others = [q for q in self.ring if q is not p]
+        if len(others) == 1:
+            return others
+        return []
+
     def _leave_ring(self, p):
         """【v0.28】某人生命归 0 → 当场退出存活环（全项目唯一的摘人口）。"""
         if self.ring.remove(p):
@@ -2173,7 +2192,10 @@ class Game:
         spreaders = []    # 散连击：一次多选
         bursters = []     # 连击：一次性分配发数
         cat_splits = []   # 【v0.39】猫尾草：连击 N 发 → 玩家分配到左右两侧
-        cat_tails = []    # 【v0.39】猫尾草：声明时环上无活人 → 推迟到攻击末尾再算
+        # ★★★【v0.74.1】删掉了 v0.39 那个 `cat_tails` 列表 —— 它只被 append、
+        #   从来没人读（_resolve_cat_tail 是从 self.plans 里捞人的），
+        #   于是"推迟到攻击末尾"的猫尾草【整株消失】。
+        #   现在改由 nearest_sides() 当场给出目标（1v1 也能打），不再有"推迟"。
         # 【v0.58】被[勾取]且这回合会出手的那几株 → 目标由【勾取者】选，
         #   所以本人这一批不问（见 _hook_proxies / _hook_target_questions）。
         proxies = self._hook_proxies()
@@ -2211,11 +2233,14 @@ class Game:
             #     它的"最近两侧"必须等到本回合别人都打完、环定型之后再算。
             #     见 phase_settle 尾部 _resolve_cat_tail()。
             if p.field.spec.nearest_target:
-                sides = self.ring_neighbors(p, exclude=p)
+                # 【v0.74.1】用 nearest_sides：环上只剩 2 人时给那唯一一个活人，
+                #   不再落到"暂缓到攻击末尾"那条死路（v0.39 的 cat_tails 没人读）。
+                sides = self.nearest_sides(p)
                 if not sides:
-                    self.say("%s 释放【%s】→ 环上没有可打的活人，暂缓到攻击末尾再算"
+                    # 兜底：上面 others_alive() 已经挡掉"一个人都没有"，
+                    #   理论上走不到这儿；真走到了就明说这一击不出手。
+                    self.say("%s 释放【%s】→ 环上没有可打的活人，这一击不出手"
                              % (p.tag, p.field.spec.name))
-                    cat_tails.append(p)
                     continue
                 n = atk.lian if atk.lian > 1 else 1
                 if len(sides) == 1 or n <= 1:
@@ -2337,8 +2362,6 @@ class Game:
         # ③b【v0.27】溅射声明：有溅射的植物，逐个目标声明"往哪侧溅"。
         #    必须排在 ③ 之后 —— 两侧是【目标】的两侧，目标都还没定，问什么。
         self._splash_declare_phase()
-        # 【v0.38】[闪电一击] 声明：与溅射同批（都在 ③ 目标确定之后）。
-        self._flash_declare_phase()
         # 【v0.39】猫尾草分配：连击 N 发按玩家选择的【左右两侧发数】写进 plans。
         #   ★ 只写"打算打谁"；实际出手在【所有攻击之后】（见 phase_settle 尾部），
         #     到那时会按当时的存活环重新确认这两侧是否还活着。
@@ -2377,6 +2400,15 @@ class Game:
                     self.say("%s 声明：如果勾取成功 → 【%s】连击 %d 发全打 %s"
                              % (hk.tag, p.field.spec.name, n,
                                 (left if lc else right).tag))
+
+        # 【v0.38】[闪电一击] 声明：与溅射同批（都在 ③ 目标确定之后）。
+        # ★★【v0.74.1 挪位】必须排在【猫尾草分配之后】——
+        #   134 猫尾草的 attack 也带 flash（[闪电一击]），但它的 plans 是在上面
+        #   那段 cat_splits 里才写进去的。这句原来在 cat_splits 之前，
+        #   而 _flash_declare_phase 开头有 `if p not in self.plans: continue`
+        #   → 猫尾草整株被跳过，三发连击的"链弹向哪一侧"一道题都不问
+        #   （用户 2026-11-04 报："猫尾草三个闪电链一条都还没选择往哪弹"）。
+        self._flash_declare_phase()
 
     def _q_cat_split(self, p, sides, n, by=None, cond=False):
         """【v0.39】猫尾草：把连击 n 发分配给环上左右两侧（两侧各几发）。
@@ -5322,10 +5354,18 @@ class Game:
           到这里【重新按当前环确认】：把每发按声明顺序映射回"当前两侧"——
             · 该发所指的人此刻还活着、且仍在环上两侧 → 保留；
             · 否则该发【作废】（与"死了不打"同一精神），不转嫁、不打尸体。
-          声明时环上没活人而推迟的（cat_tails），此刻两侧重新算（其 plans 为空）。
+          ★【v0.74.1】"两侧"改用 nearest_sides()：环上只剩 2 人时它就是
+            那唯一一个活人（v0.39 的 cat_tails 推迟表是死代码，已删）。
         """
+        # ★★★【v0.74.1】这里**不许**再筛 `p.alive`。
+        #   v0.39 写的是 `nearest_target and p.alive`，而 v0.70 已经把总规则翻成
+        #   "人出局了、植物照打"（见 _resolve_plan 开头那段：成[空]才不出手，
+        #   人死亡不算）—— 普通攻击那批 `normal` 早就不筛 alive 了，只有这里漏着。
+        #   后果：猫尾草整株排在【所有攻击之后】结算，只要它主人在这一步之前被
+        #   打死（3 人局里太常见：闪电草一发就带走），它的连击就一发都不打。
+        #   用户 2026-11-04 实测："最操蛋的是它的普攻也没打出来"。
         cat_ps = [p for p in self.plans
-                  if p.field.spec.nearest_target and p.alive and p in self.released]
+                  if p.field.spec.nearest_target and p in self.released]
         if not cat_ps:
             return
         self.say("—— 猫尾草（排在所有攻击之后，按当时的存活环结算）——")
@@ -5333,13 +5373,23 @@ class Game:
         for p in self._attack_order(cat_ps):
             # 【v0.70】★ 死了也能出手（推翻 v0.34）。
             n = p.field.spec.attack.lian if p.field.spec.attack.lian > 1 else 1
-            sides = self.ring_neighbors(p, exclude=p)
-            if not sides:
-                self.say("  · %s 的【%s】：环上已无活人可打，不出手"
-                         % (p.tag, p.field.spec.name))
-                continue
-            side_set = set(sides)
+            # 【v0.74.1】与声明期同一个判据（1v1 → 那唯一一个活人）。
+            sides = self.nearest_sides(p)
             wanted = self.plans.get(p) or []
+            if not sides:
+                if p.alive:
+                    self.say("  · %s 的【%s】：环上已无活人可打，不出手"
+                             % (p.tag, p.field.spec.name))
+                    continue
+                # ★★【v0.74.1】主人已经出局：人不在环上，"最靠近自己的活人"根本
+                #   算不出来（ring_neighbors 会因为 target 不在 members 而返空）。
+                #   这时**按声明的那份兑现** —— 只剔除"此刻已出局"的目标。
+                #   为什么不干脆不出手：v0.70 起总规则是"人出局了、植物照打"，
+                #   猫尾草只是排在最后，不该因为排序靠后就被整株吞掉。
+                #   用户 2026-11-04 的 3 人局里正是这个场景（被闪电草先打死）。
+                side_set = set(wanted)
+            else:
+                side_set = set(sides)
             if not wanted and len(sides) == 1:
                 # 声明时没人、现在有一侧了 → 全给这一侧
                 wanted = [sides[0]] * n
@@ -5352,11 +5402,14 @@ class Game:
             cnt = {}
             for t in tg:
                 cnt[t.idx] = cnt.get(t.idx, 0) + 1
+            # ★ 主人出局时 sides 是空的 → 用 tg 的顺序报（同一目标只报一次）
+            _seen, _parts = set(), []
+            for s in (sides or tg):
+                if s.idx in cnt and s.idx not in _seen:
+                    _seen.add(s.idx)
+                    _parts.append("%s %d发" % (s.tag, cnt[s.idx]))
             self.say("%s 的【%s】→ %s"
-                     % (p.tag, p.field.spec.name,
-                        "、".join("%s %d发" % (t.tag, c)
-                                  for t, c in [(s, cnt[s.idx]) for s in sides
-                                               if s.idx in cnt])))
+                     % (p.tag, p.field.spec.name, "、".join(_parts)))
             self.plans[p] = tg
             self._resolve_plan(p)
 

@@ -335,7 +335,8 @@ def handle_ask(sock, m):
         print("  右：%s｜生命%s｜场上：%s(防%d)"
               % (right.get("name_tag") or right.get("name", "?"), right.get("hp", "?"),
                  right.get("plant", "?"), right.get("fang", "?")))
-        s = input("左侧打几发（0~%d，右侧自动补足；回车=全打左侧）：" % shots).strip()
+        s = input("左侧打几发（0~%d，右侧自动补足；0=全打右侧，回车=全打左侧）："
+                  % shots).strip()
         lc = int(s) if s.isdigit() and 0 <= int(s) <= shots else shots
         send_answer(sock, [lc, shots - lc])
     elif kind == "friend":

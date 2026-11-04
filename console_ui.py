@@ -312,7 +312,7 @@ class ConsoleController(SyncController):
         print("  右：%s｜生命%s｜场上：%s(防%d)"
               % (right.tag, right.hp_text(), right.field.spec.name, right.field.fang))
         while True:
-            s = input("    左侧打几发（0~%d，右侧自动补足）：" % shots).strip()
+            s = input("    左侧打几发（0~%d，右侧自动补足；0 = 全打右侧）：" % shots).strip()
             if s.isdigit() and 0 <= int(s) <= shots:
                 lc = int(s)
                 return [lc, shots - lc]

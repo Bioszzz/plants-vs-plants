@@ -565,7 +565,8 @@ def _free_port():
     return port
 
 
-def start_local_game(bridge, total=2, bots=1, start_seeds=0, rules=None):
+def start_local_game(bridge, total=2, bots=1, start_seeds=0, rules=None,
+                     session=None):
     """在本机起一个 netserver（默认：你 vs 电脑），然后作为客户端连上去。
 
     这是以前 webui.py 的行为，但现在走的是一条【真实客户端】的路 ——
@@ -615,13 +616,15 @@ def start_local_game(bridge, total=2, bots=1, start_seeds=0, rules=None):
         kill_local_game()
         return False, err
     # 记下来，供「再来一局」复用（成功之后才记，免得记下一个连不上的参数）
-    SESSION.update({"mode": "local", "host": "127.0.0.1", "port": port,
-                    "total": total, "bots": bots, "start_seeds": start_seeds,
-                    "rules": dict(rules) if isinstance(rules, dict) else {}})
+    # 【v0.74.1】session 可由调用方传入（试玩台一个进程 N 个座位，各记各的）。
+    ses = SESSION if session is None else session
+    ses.update({"mode": "local", "host": "127.0.0.1", "port": port,
+                "total": total, "bots": bots, "start_seeds": start_seeds,
+                "rules": dict(rules) if isinstance(rules, dict) else {}})
     return True, None
 
 
-def rematch(bridge):
+def rematch(bridge, session=None):
     """【v0.15】再来一局 —— 按上一局的连法重开。
 
     · 本机局（双击 网页版.bat 走的那条）：杀掉旧的 netserver，用同样的
@@ -629,35 +632,48 @@ def rematch(bridge):
     · 远程局：直接重连同一个 host:port。注意 netserver.py 是【打完一局就退出】的，
       所以能不能重开，取决于房主有没有重新运行 netserver.py —— 连不上就如实报错，
       不要假装成功让玩家干等。
+    · 【v0.74.1】试玩台局（mode="lab"）：服务端是试玩台进程里的 Room，同样直接重连；
+      真连不上就明确告诉玩家回试玩台点「一键开局」。
+
+    ★★【v0.74.1】为什么加了 session 参数：以前只有一份模块级 SESSION，而试玩台是
+      **一个进程里 N 个座位**，共用同一份 —— 名字会互相覆盖。更糟的是试玩台
+      直接调 bridge.connect()，从来没写过 SESSION，于是每个座位的「再来一局」
+      都只会得到"还没连过服务器"（用户 2026-11-04 报的就是这个）。
+      现在每个座位带自己的一份 session（见 Handler.session_ref / Seat.session）。
 
     【待确认】真·联机重赛（服务端不退出、大家投个票接着下一局）需要新协议，
       见 开发文档.txt 第八章。
     """
-    mode = SESSION.get("mode")
+    ses = SESSION if session is None else session
+    mode = ses.get("mode")
     # 【v0.63】★★ 服务端现在打完一局【不退出】（Room 回到"等人"，监听口一直开着），
     #   所以"再来一局"= 直接重连同一个地址即可 —— 不再杀进程重起。
     #   用户 2026-10-23："再来一局时，需要重启服务器，这其实是很麻烦的，
     #   再来一局干脆就不要重启服务器，保留名字，座位等等一系列信息。"
     #   ★ 顺序很重要：先连；连不上才退回"重起一个本机服务端"的老办法
     #     （兼容房主手动关掉了服务端 / 用的是不支持常驻的旧版）。
-    if mode in ("local", "remote"):
-        host, port = SESSION.get("host"), SESSION.get("port")
+    if mode in ("local", "remote", "lab"):
+        host, port = ses.get("host"), ses.get("port")
         if not host or not port:
             return False, "不知道上一局连的是哪台服务器，请在下面手动填地址重连。"
         ok, err = bridge.connect(host, port, retry=2.5)
         if ok:
             # 【v0.63】重连之后把名字再报一次：服务端据此把座位复原成上一局的
             #   号位（不然"谁先点再来一局谁就是 1 号位"，名字会跟座位错位）。
-            nm = SESSION.get("name")
+            nm = ses.get("name")
             if nm:
                 bridge.send_name(nm)
             return True, None
         if mode == "local":
             # 本机服务端真的没了（手动关了 / 崩了）→ 用同样的参数重起一个
-            return start_local_game(bridge, SESSION.get("total", 2),
-                                    SESSION.get("bots", 1),
-                                    SESSION.get("start_seeds", 0),
-                                    SESSION.get("rules", {}))
+            return start_local_game(bridge, ses.get("total", 2),
+                                    ses.get("bots", 1),
+                                    ses.get("start_seeds", 0),
+                                    ses.get("rules", {}),
+                                    session=ses)
+        if mode == "lab":
+            return False, ("试玩台的服务端已经关了 —— 回试玩台页面点「一键开局」重开，"
+                           "那里能保留同样的座位配置。")
         return False, ("重连 %s:%d 失败 —— 服务端可能已经关掉了，"
                        "要让房主重新运行 netserver.py 才能再来一局。" % (host, port))
     return False, "还没连过服务器，先在下面开一局吧。"
@@ -699,6 +715,15 @@ class Handler(BaseHTTPRequestHandler):
     #     这是纯粹的破坏行为，所以后端直接拒。
     name_ref = None
     no_local = False
+    # 【v0.74.1】session_ref —— 「上一局是怎么连的」这份记录的容器。
+    #   None = 用模块级 SESSION（普通单开就是这样，行为与以前一模一样）。
+    #   试玩台会为每座位塞一个自己的 dict：N 个座位共用一个进程，共用一份
+    #   SESSION 的话 host/port 还好，但 `name` 会互相覆盖 → 再来一局时报错名字。
+    session_ref = None
+
+    def _session(self):
+        ref = self.session_ref
+        return ref if ref is not None else SESSION
 
     def _fixed_name(self):
         ref = self.name_ref
@@ -760,7 +785,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, err = self.bridge.connect(host, port)
             if ok:
                 # 记下来给「再来一局」用（重连同一个地址）
-                SESSION.update({"mode": "remote", "host": host, "port": port})
+                # 【v0.74.1】写到"本页那份 session"（试玩台每座位一份）
+                self._session().update({"mode": "remote", "host": host, "port": port})
             return self._json({"ok": ok, "err": err})
 
         if path == "/api/local":
@@ -778,8 +804,10 @@ class Handler(BaseHTTPRequestHandler):
                 _as_int(body.get("total"), 2),
                 _as_int(body.get("bots"), 1),
                 _as_int(body.get("start_seeds"), 0),
-                body.get("rules"))       # 【v0.25】房间规则（可缺省 → 全默认）
-            return self._json({"ok": ok, "err": err, "session": dict(SESSION)})
+                body.get("rules"),       # 【v0.25】房间规则（可缺省 → 全默认）
+                session=self._session())  # 【v0.74.1】写本页那份 session
+            return self._json({"ok": ok, "err": err,
+                               "session": dict(self._session())})
 
         if path == "/api/update-install":
             # 【v0.69】一键更新：下载 → 校验 → 备份 → 覆盖（全在 updater.py 里）
@@ -788,7 +816,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(install_update())
 
         if path == "/api/rematch":
-            ok, err = rematch(self.bridge)
+            ok, err = rematch(self.bridge, self._session())
             return self._json({"ok": ok, "err": err})
 
         if path == "/api/disconnect":
@@ -810,7 +838,8 @@ class Handler(BaseHTTPRequestHandler):
                 ref["name"] = name
                 info = {"player": name, "recent": []}
             # 【v0.63】重赛时要拿它把座位复原（服务端按名字认人）
-            SESSION["name"] = name
+            # 【v0.74.1】写本页那份 session —— 试玩台多座位才不会互相盖名字
+            self._session()["name"] = name
             self.bridge.send_name(name)
             return self._json({"ok": True, "names": info})
 

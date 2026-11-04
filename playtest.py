@@ -121,6 +121,12 @@ class Seat:
         self.port = port
         self.name = name
         self.name_ref = {"name": name}
+        # 【v0.74.1】每个座位【自己一份】"上一局怎么连的"记录，给「再来一局」用。
+        #   ★ 以前试玩台直接调 s.bridge.connect()，从没写过 webui.SESSION，
+        #     于是座位上点「再来一局」永远得到"还没连过服务器"（用户 2026-11-04 报）。
+        #   ★ 也不能退回去共用模块级 SESSION：一个进程 N 个座位，name 会互相覆盖。
+        self.session = {"mode": None, "host": None, "port": None,
+                        "total": 2, "bots": 0, "start_seeds": 0, "rules": {}}
         self.bus = Bus()                # webui 的事件总线（缓存状态 + 回放）
         self.bridge = Bridge(self.bus)  # 真正的 TCP 客户端
         self.httpd = None
@@ -135,6 +141,7 @@ class Seat:
             "bridge": self.bridge,
             "name_ref": self.name_ref,   # 预填名字、且不写 names.json
             "no_local": True,            # 禁止「本机开一局」（会拆台）
+            "session_ref": self.session,  # 【v0.74.1】「再来一局」用本座位自己的记录
         })
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), cls)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -286,6 +293,15 @@ class Lab:
             #    （player_names），晚到的名字本局不生效 —— 战报里就全是 player1/2/3。
             #    这时连接刚建好，服务端的读线程一 accept 就能读到这条报到消息。
             s.bridge.send_name(s.name)
+            # 【v0.74.1】记下本座位"上一局怎么连的" → 页面上的「再来一局」会直接
+            #   重连同一个 game_port（Room 打完一局不退出，见 webui v0.63）。
+            #   mode="lab" 只影响"重连失败时那句提示"：让玩家回试玩台点「一键开局」。
+            s.session.update({
+                "mode": "lab", "host": "127.0.0.1", "port": game_port,
+                "total": total, "bots": bots, "start_seeds": start_seeds,
+                "rules": dict(rules) if isinstance(rules, dict) else {},
+                "name": s.name,
+            })
 
         self.error = ""
         self._emit()
