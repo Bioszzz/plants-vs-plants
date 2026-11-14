@@ -751,6 +751,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._file("app.js")
         if path == "/style.css":
             return self._file("style.css")
+        # 【图鉴不在这个服务里】图鉴是**独立服务** codex_server.py（独立进程、独立
+        #   端口、独立入口 图鉴.bat / 图鉴.sh）。这里一条路由都不留，理由：
+        #   ① 依赖方向 —— 图鉴跟对局无关，不该要求"先起对局前端才能翻图鉴"；
+        #   ② 生命周期 —— 对局前端随一局开关，图鉴是想翻就翻的读物；
+        #   ③ 你 2026-11-13 原话："不要让它当玩家下面的子网页"。
+        #   ★ 数据仍然同源：codex_server 调的也是 build_catalog()。
         if path == "/api/status":
             return self._json(self.bridge.status())
         if path == "/api/catalog":
@@ -1000,6 +1006,8 @@ def main():
     print("《植物斗争》网页版客户端已启动：%s" % url)
     print("  · 在页面上填服务器 IP 后点「连接」；或点「本机开一局（你 vs 电脑）」。")
     print("  · 本进程只负责界面与转发，规则和结算都在服务端（netserver.py / engine.py）。")
+    print("  · 想看植物图鉴：另外跑 `python codex_server.py`（双击 图鉴.bat / sh 图鉴.sh），")
+    print("    那是独立页面，不占这个端口，也不需要对局开着。")
 
     if opt["server"]:
         host, sport = split_addr(opt["server"])

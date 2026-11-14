@@ -1,0 +1,211 @@
+/* codex.css —— 植物图鉴页专用样式
+   ★ 只在 codex.html 里加载；战斗页（index.html）不引这个文件，
+     所以这里怎么写都不会影响对局界面。
+   ★ 配色一律用 style.css 的 :root 变量，跟着主题走。 */
+
+#codex-app {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100vh;
+  min-height: 100dvh;          /* 手机地址栏收起时不留空档，理由同 style.css */
+}
+
+/* ★ 必须写这一条：flex 子项的 min-width 默认是 auto，
+   会把「横向 nowrap 的列表」的 min-content 宽度当成最小宽度，
+   于是整个容器被撑出屏幕右侧（手机上表现就是搜索框/详情卡右边被裁掉）。
+   min-width: 0 才允许子项缩到容器宽度以内。 */
+#codex-app > * { min-width: 0; }
+
+/* ---------- 顶栏 ---------- */
+#codex-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 4px 0;
+  flex-wrap: wrap;
+}
+#codex-top .brand { display: flex; align-items: center; gap: 10px; }
+#codex-top h1 { font-size: 17px; font-weight: 500; margin: 0; letter-spacing: 2px; }
+
+/* ---------- 搜索 ---------- */
+#codex-search-wrap { display: flex; align-items: center; gap: 10px; }
+#codex-q {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+#codex-q:focus { border-color: var(--green-dim); }
+#codex-q::placeholder { color: var(--text-dim); }
+#codex-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 主体：左列表 + 右详情 ---------- */
+#codex-main {
+  display: grid;
+  grid-template-columns: 268px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+#codex-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: calc(100dvh - 190px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.cx-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.cx-item:hover { background: var(--card-hi); }
+.cx-item.on { border-color: var(--green); background: var(--card-hi); }
+.cx-item.on .cx-nm { color: var(--green); }
+
+.cx-no {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 24px;
+  font-variant-numeric: tabular-nums;
+}
+/* 占位美术与战斗卡片同一套算法（app.js 的 hueOf / artStyle），
+   所以图鉴里这株的颜色和对局里看到的一模一样 */
+.cx-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #0e1512;
+}
+.cx-nm { font-size: 13px; }
+
+/* ---------- 详情卡 ---------- */
+#codex-detail {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px 22px;
+  min-height: 300px;
+}
+
+.cx-head { display: flex; align-items: center; gap: 14px; }
+.cx-art {
+  width: 62px;
+  height: 62px;
+  border-radius: 16px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 600;
+  color: #0e1512;
+}
+.cx-title { font-size: 20px; font-weight: 500; letter-spacing: 1px; }
+.cx-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+
+.cx-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 0; }
+.cx-chip {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #1d2521;
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+}
+.cx-chip b { color: var(--text); font-weight: 500; }
+
+/* 风味文案：金色竖线，整页最显眼的一行 */
+.cx-flavor {
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--gold);
+  border-left: 3px solid var(--gold);
+  padding: 2px 0 2px 12px;
+  margin: 18px 0 4px;
+}
+
+.cx-sec { margin-top: 20px; }
+.cx-sec-h {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  margin-bottom: 7px;
+}
+.cx-desc {
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--text);
+}
+.cx-story {
+  font-size: 13.5px;
+  line-height: 1.9;
+  color: var(--text-dim);
+}
+.cx-missing { font-size: 13px; color: var(--danger); }
+
+/* 空状态（搜索没命中） */
+.cx-empty { color: var(--text-dim); font-size: 13px; padding: 14px 2px; }
+
+/* ---------- 手机 ---------- */
+@media (max-width: 700px) {
+  #codex-app {
+    padding: calc(10px + env(safe-area-inset-top))
+             calc(10px + env(safe-area-inset-right))
+             calc(10px + env(safe-area-inset-bottom))
+             calc(10px + env(safe-area-inset-left));
+    gap: 10px;
+  }
+  /* 列表改成横向滑动条：一屏只留详情，点一下换一株 */
+  #codex-main { grid-template-columns: minmax(0, 1fr); }
+  #codex-list {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-height: none;
+    padding: 0 0 6px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .cx-item { flex: 0 0 auto; }
+  .cx-no { display: none; }
+  #codex-detail { padding: 16px 14px 20px; min-height: 0; }
+  .cx-art { width: 54px; height: 54px; font-size: 22px; border-radius: 14px; }
+  .cx-title { font-size: 18px; }
+  .cx-flavor { font-size: 14.5px; }
+  /* iOS 焦点放大：输入框小于 16px 会把整页缩放过去 */
+  #codex-q { font-size: 16px; }
+}

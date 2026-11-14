@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#121815">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>植物图鉴 · 植物斗争</title>
+<!-- 复用战斗页的配色与通用类，再叠一层图鉴专用样式（不反向影响战斗页） -->
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="codex.css">
+</head>
+<body>
+
+<div id="codex-app">
+
+  <header id="codex-top">
+    <div class="brand">
+      <span class="logo"></span>
+      <h1>植物图鉴</h1>
+    </div>
+    <div class="meta">
+      <span class="chip" id="codex-count">载入中…</span>
+    </div>
+  </header>
+
+  <div id="codex-search-wrap">
+    <input id="codex-q" type="text" autocomplete="off" spellcheck="false"
+           placeholder="搜编号（4 = 耗种 4，45 = 水蜜桃）或名称、关键词">
+    <span id="codex-hint"></span>
+  </div>
+
+  <main id="codex-main">
+    <nav id="codex-list" aria-label="植物列表"></nav>
+    <article id="codex-detail">
+      <div class="cx-empty">正在读取图鉴……</div>
+    </article>
+  </main>
+
+</div>
+
+<!-- ★ 刻意不引 app.js：那个文件一加载就会连 /api/events（SSE），
+     图鉴是独立读物，不需要连对局，也不该白占一个长连接。 -->
+<script src="codex.js"></script>
+</body>
+</html>
