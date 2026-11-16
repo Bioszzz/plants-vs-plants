@@ -343,13 +343,45 @@ body {
 .slot-sub.out { color: var(--danger); letter-spacing: 1px; }
 .pcard.dead .pname { text-decoration: line-through; text-decoration-color: var(--text-dim); }
 
+/* 【v0.76】回退面板：两个常用键等宽并排；"指定回合 + 退回"底部对齐 */
+.undo-quick {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;
+}
+.undo-grid {
+  display: flex; gap: 8px; align-items: flex-end; margin-top: 14px;
+}
+.undo-grid .field { margin: 0; flex: 1 1 auto; }
+.undo-grid .btn { flex: 0 0 auto; }
+/* 数字输入框默认是浅底白框，跟深色卡片完全不搭 —— 这里跟 .field input 同一套 */
+.undo-grid input {
+  width: 100%; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 9px;
+  padding: 10px 12px; font-size: 14px; font-family: inherit;
+}
+.undo-grid input:focus { outline: none; border-color: var(--green); }
+
 /* ---------- 连接界面 ---------- */
 .hidden { display: none !important; }
 
 #srv-chip { color: var(--green); border-color: var(--green-dim); }
-#btn-disc {
-  font-family: inherit; cursor: pointer; transition: color .12s, border-color .12s;
+
+/* 【v0.76】顶栏上「能点的 chip」必须一眼看得出来。
+   ★ 踩过的坑：回退 / 录像 当初只写了 class="chip"，忘了补按钮样式 ——
+     于是鼠标指过去是箭头、字体也不是页面的字，看着跟旁边静态的「第 1 回合」
+     一模一样。用户原话："只有断开按钮是点的动的"（其实能点，只是看不出来）。
+     所以规则写成 button.chip 的通则，以后再加按钮自动有手型 + 悬停。 */
+#topbar button.chip {
+  font-family: inherit;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
 }
+#topbar button.chip:hover {
+  color: var(--text); border-color: #4a5b50; background: var(--card-hi);
+}
+#topbar button.chip:disabled { opacity: .45; cursor: default; }
+#topbar button.chip:active { transform: translateY(1px); }
+/* 【v0.76】回退的分裂按钮：主键 + 一个小箭头（只展开更多选项） */
+#topbar button.chip.caret { padding: 3px 6px; margin-left: -4px; }
 #btn-disc:hover { color: var(--danger); border-color: #6d3636; }
 
 .overlay {
@@ -387,30 +419,86 @@ body {
 }
 .field input:focus { outline: none; border-color: var(--green); }
 
+/* 【v0.76】表单里的下拉框 —— 浏览器默认样式是浅色方角，放在深色面板里很突兀。
+   跟 .field input 用同一套配色/圆角/字号，看着才是同一个画风。 */
+.field select {
+  width: 100%; background: #161d19; color: var(--text);
+  border: 1px solid var(--line); border-radius: 9px;
+  padding: 10px 12px; font-size: 14px; font-family: inherit;
+  appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+                    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 34px;
+}
+.field select:focus { outline: none; border-color: var(--green); }
+
+/* 【v0.76】"高级选项"折叠块：默认收起，别抢主流程的注意力 */
+details.adv {
+  margin-top: 12px; padding: 8px 10px;
+  border: 1px dashed var(--line); border-radius: 10px;
+}
+details.adv > summary {
+  cursor: pointer; font-size: 12px; color: var(--text-dim);
+  list-style: none; user-select: none;
+}
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before {
+  content: '▸ '; color: var(--text-dim);
+}
+details.adv[open] > summary::before { content: '▾ '; }
+details.adv > summary:hover { color: var(--text); }
+
 .btn.wide { display: block; width: 100%; text-align: center; }
 
-/* 【v0.22】「本机开一局」的参数行：人数 / 电脑 / 开局种子 三个小格。
-   连接卡片本来就窄，所以用小号居中输入框 —— 不能让几个数字把卡片撑长。 */
-.local-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin-bottom: 10px;
+/* 【v0.76】玩家选项（服务器友好 / 自动录像）。
+   ★ 这不是房间规则 —— 规则由房主定（仍走 .rulecheck 那套）。这两条是
+     "我这一端"的偏好：要不要自己存录像、要不要自己算战报。
+   ★ 视觉上必须跟 .rulecheck 区分开：它是可改的房间参数，这是个人设置，
+     所以不给勾选框配小标题，而是一行说明、字号更小、颜色更淡。 */
+.prefs { display: flex; flex-direction: column; gap: 7px; margin-bottom: 12px; }
+.prefs label {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12px; color: var(--text-dim); line-height: 1.45;
+  text-align: left; cursor: pointer;
 }
-.local-row .lite { display: block; }
-.local-row .lite span {
-  display: block; font-size: 11px; color: var(--text-dim);
-  margin-bottom: 4px; text-align: center;
+/* ★ 自绘复选框：系统默认那个在深色主题下是一块刺眼的白方块，
+   跟整页（#161d19 底的输入框）完全不是一个画风。 */
+.prefs input {
+  appearance: none; -webkit-appearance: none;
+  width: 15px; height: 15px; margin: 1px 0 0; flex: none;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: #161d19; cursor: pointer;
+  transition: background .12s, border-color .12s;
+  position: relative;
 }
-.local-row .lite input {
-  width: 100%; background: #161d19; color: var(--text);
-  border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 6px; font-size: 13px; font-family: inherit; text-align: center;
+.prefs input:hover { border-color: #4a5b50; }
+.prefs input:checked {
+  background: var(--green-dim); border-color: var(--green);
 }
-.local-row .lite input:focus { outline: none; border-color: var(--green); }
+.prefs input:checked::after {
+  content: ''; position: absolute;
+  left: 4px; top: 1px; width: 4px; height: 8px;
+  border: solid #eafaf0; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+/* 开局中（表单被 disable）要看得出来改不了。
+   ★ 整个 label 一起变淡 —— 只灰勾选框的话，看起来像"这个框坏了"，不像"现在不能改"。
+     :has() 在旧浏览器上不支持，那种情况退化成只灰勾选框，无害。 */
+.prefs input:disabled { opacity: .45; cursor: default; }
+.prefs input:disabled:hover { border-color: var(--line); }
+.prefs label:has(input:disabled) { opacity: .55; cursor: default; }
+.prefs b { color: var(--text); font-weight: 600; }
+.prefs code {
+  font-family: inherit; color: var(--green); background: #161d19;
+  border-radius: 4px; padding: 0 4px;
+  white-space: nowrap;      /* 路径不许被拆成「对局录 / 像/」两行 */
+}
 
-/* 【v0.25】房间规则勾选项（房主控制台 / 本机开一局各一处）。
-   单独一个类，不蹭 .field / .lite —— 那两个把 input 撑成 100% 宽，
+/* 【v0.25】房间规则勾选项（房主控制台 / 多开试玩台各一处）。
+   单独一个类，不蹭 .field —— .field 把 input 撑成 100% 宽，
    套在复选框上会变成一条横贯整行的方块。 */
 .rulecheck {
   display: flex; align-items: flex-start; gap: 8px;
@@ -718,7 +806,7 @@ body {
   .chip { padding: 5px 10px; }
 
   /* iOS 焦点放大：这一条不能省，否则手指一点输入框，整页就被缩放过去 */
-  .field input, .pk-search input, .numrow input, .local-row input { font-size: 16px; }
+  .field input, .pk-search input, .numrow input { font-size: 16px; }
 
   /* 试玩台座位表：一行放不下「号 + 名字 + 状态 + 链接」→ 链接掉到第二行 */
   .seat-row { flex-wrap: wrap; row-gap: 2px; }

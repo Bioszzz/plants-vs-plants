@@ -89,8 +89,9 @@ function teamBadge(idx, st) {
 /* ---------- 启动 ---------- */
 fetch('/api/catalog').then(r => r.json()).then(d => {
   catalog = d.plants;
-  // 【v0.49】可选规则集的勾选框由服务端元数据生成，不在 HTML 里写死。
-  renderRuleOptions(d.rule_options || []);
+  // 【v0.76】这里原来还有一行"生成可选规则勾选框"的调用 —— 给「本机开一局」用的。
+  //   那个功能删了（被多开试玩台整个覆盖），规则改由房主在控制台/试玩台定，
+  //   玩家这边不再选，所以这行跟着一起删了。
   // 【v0.60】图鉴补上来了 → 把正在显示的那道选牌题重画一遍。
   //   ★ 只重画 plant，且只在"还没提交"时重画 —— 否则会盖掉「已提交，等待其他玩家」。
   if (CUR_ASK && CUR_ASK.kind === 'plant' && !busy) renderPlant(CUR_ASK);
@@ -139,6 +140,14 @@ function onEvent(ev) {
   if (ev.state) renderBoard(ev.state);
   if (ev.type === 'hello') return onHello(ev);
   if (ev.type === 'msg') { addLog(ev.text); return; }
+  // 【v0.76】回退：服务端把这一局从头重播，前端必须先清空战报，
+  //   否则旧的那份和新播的那份会并排躺着，看起来像打了两遍。
+  if (ev.type === 'reset') {
+    const box = $('log');
+    if (box) box.innerHTML = '';
+    if (ev.text) addLog(ev.text);
+    return;
+  }
   if (ev.type === 'wait') return onWait(ev.text);
   if (ev.type === 'end') return showOver(ev);
   if (ev.type === 'ask') return showAsk(ev);
@@ -317,109 +326,41 @@ $('btn-connect').onclick = () => {
   doConnect('/api/connect', { host: host, port: port });
 };
 
-/* 【v0.22】本机开一局的参数（人数 / 电脑数 / 开局种子）。
-   空框一律退回默认（2 人 / 1 电脑 / 0 种子）—— 所以什么都不填就是旧行为。
-   边界检查不在这里做：服务端（webui.start_local_game）会统一挡，
-   这边只管把界面上的数字原样递过去。 */
-/* ---------- 【v0.49】可选规则集 ----------
-   数据来源 = 服务端的 plants_data.RULE_OPTIONS（随 /api/catalog 带下来）；
-   勾选状态缓存在浏览器 localStorage，下次打开自动带出。
+/* ---------- 【v0.76】玩家选项 ----------
+   两个勾选框，都是"我这一端"的偏好（不是房间规则 —— 规则由房主定）。
 
-   ★ 界面只报"勾没勾"，"勾上对应哪个值"由服务端给的 on/off 决定 ——
-     这样 mult_cap 那种反向开关（勾「不封顶」= 0）也不用前端知道自己是反的。
-   ★ 缓存存的是【布尔】而不是 rules 值：将来 on/off 改了，缓存照样能用。 */
-let RULE_OPTIONS = [];
-const RULE_CACHE_KEY = 'pvp.rules.v1';
+     · 自动录像   → 服务端把答案序列也发给我，我在本地存一份录像到 对局录像/
+     · 服务器友好 → 服务端不发中文战报，我本地跑引擎自己算（帮房主省带宽）
 
-function loadRuleCache() {
-  try { return JSON.parse(localStorage.getItem(RULE_CACHE_KEY) || '{}') || {}; }
-  catch (e) { return {}; }
-}
-function saveRuleCache(obj) {
-  try { localStorage.setItem(RULE_CACHE_KEY, JSON.stringify(obj)); } catch (e) {}
+   ★ 勾了立刻报给后端（/api/prefs）；连上之前勾的也会记着，连接那一刻自动补报。
+   ★ 缓存在 localStorage：换局、重开页面都记得住（这是"我这个人"的偏好）。 */
+const PREFS_KEY = 'pvp.prefs.v1';
+
+function readPrefs() {
+  let v = {};
+  try { v = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') || {}; } catch (e) {}
+  return { record: !!v.record, friendly: !!v.friendly };
 }
 
-function renderRuleOptions(opts) {
-  RULE_OPTIONS = opts || [];
-  const box = $('l-rules');
-  if (!box) return;
-  const saved = loadRuleCache();
-  box.innerHTML = '';
-  RULE_OPTIONS.forEach(o => {
-    const lab = document.createElement('label');
-    lab.className = 'rulecheck';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.id = 'l-rule-' + o.key;
-    // 没存过 → 用服务端标的"默认是否勾上"（default_on，由 DEFAULT_RULES 算出来）
-    cb.checked = (o.key in saved) ? !!saved[o.key] : !!o.default_on;
-    cb.onchange = localLabel;
-    lab.appendChild(cb);
-    // 【v0.73】名称 + 一行简介（一直显示，不再只藏在 title 里）——
-    //   用户 2026-10-27："规则集添加简介"。勾选框只占左边一格，文字竖排两行。
-    const tx = document.createElement('div');
-    tx.className = 'rule-text';
-    const sp = document.createElement('span');
-    sp.className = 'rule-name';
-    sp.textContent = o.name;
-    tx.appendChild(sp);
-    if (o.desc) {
-      const dc = document.createElement('span');
-      dc.className = 'rule-desc';
-      dc.textContent = o.desc;
-      tx.appendChild(dc);
-    }
-    lab.appendChild(tx);
-    box.appendChild(lab);
-  });
+function pushPrefs() {
+  const r = $('p-record'), f = $('p-friendly');
+  const p = { record: !!(r && r.checked), friendly: !!(f && f.checked) };
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch (e) {}
+  fetch('/api/prefs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(p)
+  }).catch(() => {});
 }
 
-/* 勾选状态（布尔）—— 只用来写缓存 */
-function ruleToggles() {
-  const out = {};
-  RULE_OPTIONS.forEach(o => {
-    const cb = $('l-rule-' + o.key);
-    if (cb) out[o.key] = !!cb.checked;
-  });
-  return out;
-}
+(function initPrefs() {
+  const p = readPrefs();
+  const r = $('p-record'), f = $('p-friendly');
+  if (r) { r.checked = p.record; r.onchange = pushPrefs; }
+  if (f) { f.checked = p.friendly; f.onchange = pushPrefs; }
+  if (p.record || p.friendly) pushPrefs();     // 后端可能刚重启，补报一次
+})();
 
-/* 真正发给服务端的 rules（键 → 值） */
-function ruleValues() {
-  const out = {};
-  RULE_OPTIONS.forEach(o => {
-    const cb = $('l-rule-' + o.key);
-    out[o.key] = (cb && cb.checked) ? o.on : o.off;
-  });
-  return out;
-}
-
-function localParams() {
-  const num = (id, d) => {
-    const v = parseInt(($(id).value || '').trim(), 10);
-    return isNaN(v) ? d : v;
-  };
-  return { total: num('l-total', 2), bots: num('l-bots', 1),
-           start_seeds: num('l-seeds', 0),
-           rules: ruleValues() };      // 【v0.49】可选规则集（默认值服务端补齐）
-}
-
-/* 按钮上把参数写出来 —— 填了 3 人局却看见按钮还写着"你 vs 电脑"，
-   会让人怀疑自己填了没用。 */
-function localLabel() {
-  const p = localParams();
-  const humans = Math.max(0, p.total - p.bots);
-  $('btn-local').textContent = '本机开一局（' + humans + ' 真人 + ' + p.bots + ' 电脑' +
-    (p.start_seeds > 0 ? ' · 开局种子 ' + p.start_seeds : '') + '）';
-}
-
-['l-total', 'l-bots', 'l-seeds'].forEach(id => { $(id).oninput = localLabel; });
-localLabel();
-
-$('btn-local').onclick = () => {
-  saveRuleCache(ruleToggles());     // 【v0.49】记住这次勾了什么
-  doConnect('/api/local', localParams());
-};
 
 $('btn-disc').onclick = () => {
   busy = false;
@@ -427,6 +368,112 @@ $('btn-disc').onclick = () => {
   MY_ALIVE = true;
   fetch('/api/disconnect', { method: 'POST' });
 };
+
+/* ---------- 【v0.76】回退：先问"退到哪一回合"，再发请求 ----------
+   ★ 为什么要点两下：原来只有"退回本回合开始"一种，想退到上一回合只能
+     退完再退回一次（而且战报要重播两遍）。现在一次就能退到指定回合。
+     真正的动作仍然在服务端（截断录像 + 重建 + 快进），这里只负责把
+     "退到第几回合" 传过去。 */
+function currentRound() {
+  const m = ($('round-chip').textContent || '').match(/(\d+)/);
+  const n = m ? parseInt(m[1], 10) : 1;
+  return isNaN(n) ? 1 : n;
+}
+
+function openUndoPick() {
+  const N = currentRound();
+  $('undo-hint').textContent = '当前第 ' + N + ' 回合';
+  $('undo-this').textContent = '本回合开始';
+  $('undo-prev').textContent = '上一回合';
+  const inp = $('undo-round');
+  inp.max = String(N);
+  inp.value = String(N);
+  $('undo-err').textContent = '';
+  $('undo-pick').classList.remove('hidden');
+}
+
+function closeUndoPick() {
+  $('undo-pick').classList.add('hidden');
+}
+
+/* round：数字 = 退到第 N 回合开始；'prev' = 上一回合（由服务端算）；
+   null/不传 = 本回合开始。★ "上一回合" 交给服务端算，因为界面上那个回合数
+   可能比引擎慢一拍 —— 差 1 就退错地方了。 */
+function doUndo(round) {
+  const b = $('btn-undo');
+  closeUndoPick();
+  if (b.disabled) return;
+  b.disabled = true;
+  b.textContent = '↶ 回退中…';
+  const body = (round === null || round === undefined) ? {} : { round: round };
+  fetch('/api/undo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) addLog('（回退没成功：' + (j.err || '未知原因') + '）');
+    })
+    .catch(() => addLog('（回退请求没送到服务端）'))
+    .finally(() => { b.disabled = false; b.textContent = '↶ 回退'; });
+}
+
+/* 【v0.76】回退 = 分裂按钮：
+     主键「↶ 回退」→ 一下点完，退回本回合开始（最常见的那种"手抖了"）；
+     「▾」→ 才展开"上一回合 / 指定回合"。
+   ★ 用户 2026-11-16："多态不应该影响方便性" —— 常用动作不许被选项挡住。 */
+$('btn-undo').onclick = () => {
+  if ($('btn-undo').disabled) return;
+  doUndo(null);
+};
+$('btn-undo-more').onclick = () => openUndoPick();
+$('undo-this').onclick = () => doUndo(null);
+$('undo-prev').onclick = () => doUndo('prev');
+$('undo-go').onclick = () => {
+  let v = parseInt($('undo-round').value, 10);
+  if (isNaN(v) || v < 0) v = 0;
+  doUndo(v);
+};
+$('undo-cancel').onclick = closeUndoPick;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeUndoPick();
+});
+
+/* 【v0.76】导出本局录像 —— 直接写进项目的 对局录像/，不进浏览器的下载目录。
+   ★ 用下载的话：文件名长、还得自己拼相对路径才能重放（`python replay.py 对局录像/xxx.json`）。
+     存进对局录像之后，`python replay.py` 不带参数就放最新那份。
+   对局中途也能导（导的是"到此刻为止"的输入序列，重放会停在同一个地方）。 */
+$('btn-replay').onclick = () => {
+  const b = $('btn-replay');
+  if (b.disabled) return;
+  b.disabled = true;
+  b.textContent = '⭳ 导出中…';
+  fetch('/api/replay-save', { method: 'POST' })
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) { addLog('（导出没成功：' + (j.err || '未知原因') + '）'); return; }
+      addLog('（录像已存进 对局录像/' + j.name + '　重放：python replay.py）');
+    })
+    .catch(() => addLog('（导出请求没送到服务端）'))
+    .finally(() => { b.disabled = false; b.textContent = '⭳ 录像'; });
+};
+
+/* 这个页面到底支不支持回退 / 导出 —— 普通单开时两个按钮都不该出现，
+   免得玩家点了只收到一句"这一局不支持"。 */
+fetch('/api/caps').then(r => r.json()).then(j => {
+  if (j && j.undo) {
+    $('btn-undo').classList.remove('hidden');
+    $('btn-undo-more').classList.remove('hidden');   // 分裂按钮的小箭头
+  }
+  if (j && j.replay) $('btn-replay').classList.remove('hidden');
+  // 【v0.76】玩家选项：试玩台的座位页不给（N 个座位共用一个进程，各存一份录像没意义）
+  if (j && j.prefs === false) {
+    const t = $('prefs-title'), b = $('prefs-box');
+    if (t) t.classList.add('hidden');
+    if (b) b.classList.add('hidden');
+  }
+}).catch(() => {});
 
 function doConnect(url, body) {
   // 【v0.35】连之前先把名字存下并报给服务端。
@@ -442,7 +489,7 @@ function doConnect(url, body) {
   }).catch(() => {});
 
   $('conn-err').textContent = '连接中……';
-  const btns = [$('btn-connect'), $('btn-local')];
+  const btns = [$('btn-connect')];
   btns.forEach(b => { b.disabled = true; });
   fetch(url, {
     method: 'POST',

@@ -26,6 +26,7 @@ v0.22：房主控制台（自带一个 HTTP 服务，默认 8090）+ 开局种�
 import json
 import os
 import queue
+import random
 import socket
 import sys
 import threading
@@ -36,7 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import netproto
 from bots import BotController
-from engine import Controller, Game, Observer, PENDING
+from engine import Controller, Game, Observer, PENDING, UndoRequest
+from replay import HybridController, ReplayError
 from plants_data import (DEFAULT_RULES, normalize_rules, describe_rules,
                          rule_options)
 
@@ -96,6 +98,14 @@ class RemoteController(Controller):
         self._q = None       # 当前待答的问题
         self._dead = False
         self._err = None
+        # 【v0.76】玩家选项 —— 连接后随时可改，服务端即时生效：
+        #   friendly  = 服务器友好：**不发中文战报**，改由客户端本地跑引擎自算。
+        #               （引擎是确定性的，同一串答案重跑得到逐字相同的战报。）
+        #   want_rows = 自动录像：把增量答案也推过来，客户端自己存一份录像。
+        #   ★ 两者都需要"答案序列"，所以都用 needs_rows 判。
+        #     内存里的录制是【永远开】的（几十 KB），否则中途勾选就补不出历史答案。
+        self.friendly = False
+        self.want_rows = False
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     # ---------- 后台读线程 ----------
@@ -113,6 +123,11 @@ class RemoteController(Controller):
             if isinstance(m, dict) and m.get("type") == "name":
                 self._set_custom_name(m.get("value"))
                 continue
+            # 【v0.76】玩家选项同样是"报到消息"，不是一次决策 ——
+            #   塞进 _inbox 会被 poll 当无关消息丢掉。
+            if isinstance(m, dict) and m.get("type") == "prefs":
+                self.apply_prefs(m)
+                continue
             self._inbox.put(m)
 
     def _set_custom_name(self, value):
@@ -126,6 +141,18 @@ class RemoteController(Controller):
             return
         self.custom = v
         self.name = v
+
+    def apply_prefs(self, m):
+        """【v0.76】收下玩家选项。中途改也生效（下一批答案起就按新设置走）。"""
+        if isinstance(m.get("friendly"), bool):
+            self.friendly = m["friendly"]
+        if isinstance(m.get("record"), bool):
+            self.want_rows = m["record"]
+
+    @property
+    def needs_rows(self):
+        """要不要把答案序列推给他 —— 自算战报 和 自动录像 都要。"""
+        return self.friendly or self.want_rows
 
     # ---------- 发送 ----------
     def _mark_dead(self, reason):
@@ -143,6 +170,11 @@ class RemoteController(Controller):
             raise ConnectionError(self._err)
 
     def notify(self, text):
+        # 【v0.76】服务器友好：中文战报一个字都不发，客户端本地跑引擎自己生成。
+        #   ★ 只压 notify —— notify_state 里的结构化场面照发（前端要它画卡片），
+        #     而且那每回合就一行，省不下来什么。
+        if self.friendly:
+            return
         self._send({"type": "msg", "text": text})
 
     def notify_state(self, text, state):
@@ -150,7 +182,13 @@ class RemoteController(Controller):
 
         老客户端（netclient）只读 text，多出来的字段会被忽略，
         所以这是向后兼容的；网页客户端则直接拿 state 渲染卡片，不用解析中文。
+
+        【v0.76】服务器友好：只发 state，不发那行中文 —— 客户端本地跑引擎时
+        本来也重新算出了同一份场面（战报文本由它自己出）。
         """
+        if self.friendly:
+            self._send({"type": "state", "state": state})
+            return
         self._send({"type": "msg", "text": text, "state": state})
 
     def wait_hint(self, text):
@@ -196,6 +234,14 @@ class RemoteController(Controller):
                 kept.append(m)
         for m in kept:
             self._inbox.put(m)
+
+    def drop_pending_answers(self):
+        """【v0.76】回溯快进前清掉堆积的旧答案。
+
+        ★ 只清 answer：`conn_lost` 那条必须留着 —— poll 靠它判掉线
+          （清了就等于把"人已经断了"这件事一起丢掉）。
+        """
+        self._drop_stale_answers()
 
 
 class ConsoleObserver(Observer):
@@ -335,6 +381,146 @@ class Room:
         self.games = 0               # 这个房间一共打了多少局
         self.last_summary = ""       # 上一局的结局（一行字，给控制台和结束面板看）
         self.history = []            # 最近几局的结局（控制台展示用，最多留 10 条）
+        # 【v0.76】录像：当前这一局的 Game 对象（打完也不清，留着导出）。
+        #   ★ 只在游戏线程写、HTTP 线程读；读时允许"少最后几条"，但不会崩
+        #     —— 所以不为它加锁（引擎每回合要写几十次，加锁得不偿失）。
+        self.game = None
+        # 【v0.76】续玩：拿一份录像当前缀（None = 正常开局）。开局时由 start() 填。
+        self.resume = None
+        # 【v0.76】录像落盘开关（内存录制不受它影响）。
+        self.record = True
+        # 【v0.76】局终回退：刚打完那一局的赢家名单（撤战绩时按名字减回去）
+        self._last_win_names = []
+
+    def request_undo(self, at=None):
+        """【v0.76】请把这一局退回「第 at 回合开始」（at=None = 本回合，0 = 从开局重来）。
+
+        ★ 只是打个招呼：真正的动作在引擎【等答案】那一刻发生
+          （那里抛 UndoRequest，_play_one 接住后重建）。所以这里返回 True
+          只代表"要求已记下"，不代表已经退回去了。
+        """
+        with self._lock:
+            g, st = self.game, self.state
+        if g is None or st != "playing":
+            return False, "现在没有正在进行的对局"
+        # 【v0.76】"上一回合"由服务端算，别让前端去猜：界面上那个回合数
+        #   可能比引擎慢一拍（状态是上一阶段推下去的），差 1 就退错地方。
+        if isinstance(at, str) and at.strip().lower() in ("prev", "-1", "上一回合"):
+            at = max(0, g.round - 1)
+        g.request_undo(at)
+        return True, None
+
+    def rewind_stats(self):
+        """【v0.76】局终回退：把刚打完那一局从战绩里撤掉。
+
+        否则"回退 → 又打一遍 → 又算一局"，控制台上的「共 N 局 / 胜场」会虚高。
+        平局那局没有赢家，只撤局数与历史，不用动胜场。
+        """
+        with self._lock:
+            if self.games <= 0:
+                return
+            self.games -= 1
+            for nm in self._last_win_names:
+                if nm in self.wins:
+                    self.wins[nm] -= 1
+                    if self.wins[nm] <= 0:
+                        del self.wins[nm]
+            self._last_win_names = []
+            if self.history:
+                self.history.pop()
+            self.last_summary = self.history[-1] if self.history else ""
+
+    # ---------- 【v0.76】对局录像 ----------
+    def _push_head(self, game):
+        """【v0.76】把"这一局的头部"发给要自己跑引擎的客户端。
+
+        只发 head（不含 answers）：人数 / 名字 / 开局种子 / 房间规则 / 牌库 /
+        duel_auto。客户端凭它 + 后续增量答案，就能在本地重跑出**逐字相同**的战报。
+
+        ★ 回退 / 续玩会重建 Game，这里会再发一次 —— 客户端收到 head 就清空
+          本地累积的答案重来（旧的那串已经作废了）。
+        """
+        try:
+            data = game.replay_dict()
+        except Exception:          # noqa: BLE001
+            return
+        if not data:
+            return
+        head = dict(data)
+        head["answers"] = []
+        with self._lock:
+            cs = list(self._controllers or [])
+        for c in cs:
+            if isinstance(c, RemoteController) and c.needs_rows:
+                try:
+                    c._send({"type": "rep_head", "data": head})
+                except (OSError, ConnectionError):
+                    pass
+
+    def _push_rows(self, rows):
+        """【v0.76】增量答案 → 推给「服务器友好 / 自动录像」的客户端。
+
+        挂的是 `game.on_answers`（引擎每收完一批答案回调一次）。
+        ★ 带宽账：一局答案序列约 2~5 KB，而中文战报是 50~300 KB —— 差一个数量级。
+        ★ 吞异常：推不到某个客户端，绝不许把这一局带崩。
+        """
+        with self._lock:
+            cs = list(self._controllers or [])
+        targets = [c for c in cs
+                   if isinstance(c, RemoteController) and c.needs_rows]
+        if not targets:
+            return
+        for c in targets:
+            try:
+                c._send({"type": "rep_rows", "rows": rows})
+            except (OSError, ConnectionError):
+                pass
+
+    def _save_replay(self, game, running=False):
+        """把这一局的录像写到 `对局录像/`，返回文件名（失败返回 None）。
+
+        running=False（局末）：写 `20261115_2050_2人局.json`，并删掉「进行中.json」。
+        running=True （每回合）：覆盖写 `进行中.json`，**不播报**。
+        ★ 为什么要「进行中」：对局中途崩了 / 房主强杀进程，局末那次根本不会执行。
+          有了它，最坏情况也只丢最后半回合 —— 而且这份文件本身就能 `replay.py` 重放。
+
+        为什么落盘而不是让玩家从网页点下载：
+          · 本机局是 webui 起的【子进程】，进程里的 Game 对象网页端根本够不着；
+          · 落成文件两头都能拿 —— 玩家去文件夹，或者网页那边点「导出录像」。
+        录像只有几 KB（3 回合 ≈ 2 KB），存着不心疼。
+        """
+        try:
+            data = game.replay_dict()
+            if not data:
+                return None
+            here = os.path.dirname(os.path.abspath(__file__))
+            d = os.path.join(here, "对局录像")
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            if running:
+                nm = "进行中.json"
+            else:
+                nm = "%s_%d人局.json" % (time.strftime("%Y%m%d_%H%M%S"),
+                                        len(game.players))
+            with open(os.path.join(d, nm), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            if running:
+                return nm
+            # 局末：正式的落好了，把"进行中"那份撤掉（否则文件夹里永远躺个半局）
+            try:
+                os.remove(os.path.join(d, "进行中.json"))
+            except OSError:
+                pass
+            self.bus.emit("—— 本局录像已保存：对局录像/%s（重放：python replay.py 对局录像/%s）——"
+                          % (nm, nm))
+            return nm
+        except Exception as e:      # noqa: BLE001 —— 录像失败绝不能影响对局本身
+            print("[录像] 保存失败：%s: %s" % (type(e).__name__, e))
+            return None
+
+    def _autosave(self, game):
+        """每回合结束的回调（引擎 on_round_end 调）。安静、覆盖写。"""
+        self._save_replay(game, running=True)
 
     # ---------- 控制台端口回填 ----------
     def set_console_port(self, port):
@@ -440,7 +626,8 @@ class Room:
         return True, None
 
     # ---------- 开局 ----------
-    def start(self, total=2, bots=0, start_seeds=0, game_port=8080, rules=None):
+    def start(self, total=2, bots=0, start_seeds=0, game_port=8080, rules=None,
+              resume=None, record=True):
         # 【v0.63】服务端打完一局【不退出】，此时 state 还是 waiting（replay_ready）——
         #   房主改完参数点「开局」时，必须先把那个"等下一局"的循环收掉：
         #   端口还被他占着，不先关就 bind 不上。
@@ -459,6 +646,15 @@ class Room:
         game_port = _as_int(game_port, 8080)
         # 【v0.25】房间规则一样先折好再进引擎（脏数据退回默认，见 normalize_rules）。
         rules = normalize_rules(rules)
+        # 【v0.76】续玩：拿一份录像当开局 —— 人数 / 种子 / 规则都以录像为准
+        #   （否则"同一串输入"会跑出另一局），玩家只要负责连接和以后的决策。
+        open_data = dict(resume) if isinstance(resume, dict) else None
+        if open_data:
+            if not isinstance(open_data.get("rng_seed"), int):
+                return False, "这份录像没记下随机种子，没法续玩（请用新版本重新导一份）"
+            total = _as_int(open_data.get("players"), total)
+            start_seeds = _as_int(open_data.get("start_seeds"), start_seeds)
+            rules = normalize_rules(open_data.get("rules") or {})
         if total < 2:
             return False, "人数至少 2 人"
         if bots < 0 or bots > total:
@@ -487,6 +683,10 @@ class Room:
             self.total, self.bots = total, bots
             self.start_seeds, self.game_port = start_seeds, game_port
             self.rules = rules
+            self.resume = open_data          # None = 正常开局
+            # 【v0.76】要不要把录像【落盘】。内存里的录制永远开（回退依赖它），
+            #   这个开关只管"局末/每回合写不写文件"。
+            self.record = bool(record)
             self.joined = 0
             self.winner, self.error = None, ""
             self.winners = []
@@ -587,11 +787,15 @@ class Room:
         with self._lock:
             total, bots, seeds = self.total, self.bots, self.start_seeds
             rules = dict(self.rules)          # 【v0.25】房间规则随开局参数一起冻结
+            resume = dict(self.resume) if self.resume else None
         humans = total - bots
 
         self.bus.emit("房间已开：%d 人局（%d 个真人 + %d 个电脑）" % (total, humans, bots))
         if seeds:
             self.bus.emit("开局种子：每人 %d 颗" % seeds)
+        if resume:
+            self.bus.emit("从录像续玩：先快进 %d 条答案，之后由真人接手"
+                          % len(resume.get("answers") or []))
         # 【v0.25】房间规则也播一条：不播的话，非默认规则只有房主自己知道。
         for line in describe_rules(rules):
             self.bus.emit("房间规则：%s" % line)
@@ -645,8 +849,30 @@ class Room:
 
         for _ in range(bots):
             controllers.append(BotController())
+        # ★ 引擎按"列表第 i 个 = i+1 号玩家"建人；而 BotController 本身没有 idx，
+        #   回退 / 续玩却要按 idx 把录像分给对应的人 —— 这里按列表位置补齐。
+        #   （真人那边 idx 是认领出来的座位号，排序后正好等于位置，不动它。）
+        for _i, _c in enumerate(controllers, 1):
+            if getattr(_c, "idx", None) is None:
+                _c.idx = _i
         with self._lock:
             self._controllers = list(controllers)
+
+        # 【v0.76】连接收齐之后再读一次 resume —— "局终回退"就是这条路径：
+        #   玩家在【打完一局之后】按回退，试玩台把上一局截断成"续玩前缀"塞进
+        #   self.resume，然后再把各座位连回来。那个动作发生在 _accept 期间，
+        #   函数开头那次读取是看不到的。
+        #   ★ 用完就清：resume 只对"下一局"生效，不清的话以后每次重赛都会从头快进。
+        with self._lock:
+            late = self.resume
+            self.resume = None
+        if late:
+            resume = dict(late)
+            seeds = _as_int(resume.get("start_seeds"), seeds)
+            rules = normalize_rules(resume.get("rules") or {})
+            self.bus.emit("—— 局终回退：先快进 %d 条答案，回到第 %d 回合 ——"
+                          % (len(resume.get("answers") or []),
+                             max([r.get("r", 0) for r in (resume.get("answers") or [])] or [0]) + 1))
 
         for c in controllers:
             if isinstance(c, RemoteController):
@@ -701,27 +927,114 @@ class Room:
             names.append(nm)
         self.seat_names = names
         player_names = names
-        game = Game(controllers, observers=[ConsoleObserver(self.bus.push)],
-                    start_seeds=seeds, rules=rules, player_names=player_names)
-        with self._lock:
-            self.state = "playing"
-        self._emit()
+        # ==========================================================
+        # 【v0.76】回溯循环
+        # ----------------------------------------------------------
+        # 玩家按「回退」→ 引擎在【等答案那一刻】抛 UndoRequest（唯一合法打断点）
+        # → 我们截断录像 → 让客户端清空战报 → 用「混合控制器」重开一局：
+        #     前 K 题背录像（瞬间过完，等于快进），第 K+1 题起重新问真人。
+        # socket 全程不动，座位 / 名字 / 连接一个都不变。
+        # ★ 必须用同一个 rng 种子重建，否则快进出来的是另一局。
+        # ==========================================================
+        undo_rows = None       # None = 从头开始；list = 快进用的录像
+        replay_seed = None
+        duel_auto = True
+        playable = None
+        if resume:
+            # 【v0.76】续玩 = "把整份录像当回退目标"：同一套快进逻辑，
+            #   只是 carry 是全部答案，所以快进到录像截止处就轮到真人。
+            undo_rows = [dict(r) for r in (resume.get("answers") or [])]
+            replay_seed = int(resume["rng_seed"])
+            duel_auto = bool(resume.get("duel_auto", True))
+            import replay as _replay
+            playable = _replay.clean_playable(resume.get("playable"))
+        game = None
+        while True:
+            ctrls = controllers
+            if undo_rows is not None:
+                ctrls = [HybridController(c, [], None) for c in controllers]
+            # ★ 种子必须【显式】交回去（rng_seed=），不能只传 Random(seed) 对象：
+            #   对象里读不出 seed，录出来的录像 rng_seed 会是 None —— 那份录像
+            #   永远重放不出来（用另一个随机数跑，几条答案之后就错位）。
+            game = Game(ctrls, observers=[ConsoleObserver(self.bus.push)],
+                        start_seeds=seeds, rules=rules, player_names=player_names,
+                        duel_auto=duel_auto, playable=playable,
+                        rng_seed=replay_seed)
+            # 【v0.76】把"保留的历史答案"直接带进新录像，并让录制跳过它们 ——
+            #   不跳过就会把快进的那批再记一遍，每回退一次录像翻一倍，
+            #   快进时又吃翻倍的答案 → 回合数 1-2-4-8 地往后跳。
+            game.start_record(carry=undo_rows)
+            # 【v0.76】每回合自动存一次（覆盖写「进行中.json」）——
+            #   崩溃 / 强杀进程时局末那次不会执行，靠它兜住，最坏只丢半回合。
+            #   ★ 关掉落盘时这里也不挂：钩子一挂就会写文件。
+            if self.record:
+                game.on_round_end = self._autosave
+            # 【v0.76】增量答案 → 推给「服务器友好 / 自动录像」的客户端。
+            game.on_answers = self._push_rows
+            if replay_seed is None:
+                replay_seed = game.rng_seed        # 第一局：把生成的种子记下来
+            if undo_rows is not None:
+                for h in ctrls:
+                    h.players = game.players
+                    h.rows = [r for r in undo_rows if r.get("who") == h.real.idx]
+                    h.i = 0
+                    h.fed = 0
+            with self._lock:
+                self.game = game        # 给 /api/host/replay 读
+                self.state = "playing"
+            # 【v0.76】把"这一局的头部"（人数 / 名字 / 种子 / 规则 / 牌库）发给
+            #   需要自己算战报或自己存录像的客户端。重建（回退/续玩）时也会重发，
+            #   客户端收到 head 就把本地累积的答案清空重来。
+            self._push_head(game)
+            self._emit()
 
-        aborted = False
-        try:
-            game.run()
-        except (ConnectionError, OSError) as e:
-            aborted = True
-            self.bus.emit("—— 对局中止：%s ——" % e)
-        except Exception as e:      # noqa: BLE001 —— 兜底见下面的说明
-            # 【v0.46】★★ 引擎里任何非 IO 异常都【不许让游戏线程静默死掉】。
-            #   以前这里只捕 ConnectionError/OSError，别的异常一路冒到线程顶，
-            #   客户端从此收不到任何消息 → 界面上只剩"断联"（用户 2026-10-18
-            #   报的正是这个观感，真凶其实是引擎里的 AttributeError）。
-            #   现在：完整 traceback 打到控制台，并把"对局中止：<异常>"发给所有人。
-            aborted = True
-            traceback.print_exc()
-            self.bus.emit("—— 对局中止：引擎异常 %s: %s ——" % (type(e).__name__, e))
+            aborted = False
+            try:
+                game.run()
+                break
+            except UndoRequest as _u:
+                # 算"退到哪"：目标是"第 N 回合开始" → 只留 r < N 的答案。
+                #   ★ 以前固定用 game.round（只能退本回合）；现在玩家可以指定
+                #     任意回合，甚至 0（= 从开局重来），所以以请求里的 at 为准。
+                _target = getattr(_u, "at", None)
+                if not isinstance(_target, int):
+                    _target = game.round
+                _target = max(0, min(_target, game.round))
+                rows = game.record.get("answers") or []
+                keep = [r for r in rows if r.get("r", 0) < _target]
+                undo_rows = keep
+                # 客户端手里那段战报已经播出去了（没法撤回）→ 索性清空重播。
+                # 重播走的是同一条广播通道，只是速度快得多（没人等待）。
+                _reset = {"type": "reset",
+                          "text": ("—— 已回退到第 %d 回合开始，战报重新播放 ——" % _target)
+                                  if _target > 0 else
+                                  ("—— 已回到开局（第 0 回合），战报重新播放 ——")}
+                for c in controllers:
+                    if isinstance(c, RemoteController):
+                        try:
+                            c._send(dict(_reset))
+                        except (OSError, ConnectionError):
+                            pass
+                        c.drop_pending_answers()      # 倒掉快进期间的旧答案
+                self.bus.emit("—— 回退：重跑前 %d 条答案，回到第 %d 回合 ——"
+                              % (len(keep), _target))
+                continue
+            except (ConnectionError, OSError) as e:
+                aborted = True
+                self.bus.emit("—— 对局中止：%s ——" % e)
+                break
+            except Exception as e:      # noqa: BLE001 —— 兜底见下面的说明
+                # 【v0.46】★★ 引擎里任何非 IO 异常都【不许让游戏线程静默死掉】。
+                #   以前这里只捕 ConnectionError/OSError，别的异常一路冒到线程顶，
+                #   客户端从此收不到任何消息 → 界面上只剩"断联"（用户 2026-10-18
+                #   报的正是这个观感，真凶其实是引擎里的 AttributeError）。
+                #   现在：完整 traceback 打到控制台，并把"对局中止：<异常>"发给所有人。
+                # ★ 回溯循环里必须 break —— 不 break 会一直重建、一直崩。
+                aborted = True
+                traceback.print_exc()
+                self.bus.emit("—— 对局中止：引擎异常 %s: %s ——"
+                              % (type(e).__name__, e))
+                break
 
         # 【v0.45】结局：winners 可能不止一个人（同一队友链共同获胜）。
         #   winner 保留为"恰好一人获胜时的那个 idx"（老客户端的读法不变）。
@@ -746,13 +1059,20 @@ class Room:
         #   ★ 中止（有人掉线 / 房主停掉）不算一局。
         if not aborted:
             self.games += 1
+            _names = []
             for w in winners:
                 nm = w.name or ("player%d" % w.idx)
                 self.wins[nm] = self.wins.get(nm, 0) + 1
+                _names.append(nm)
+            self._last_win_names = _names      # 局终回退时要按名字把胜场撤回去
             self.last_summary = end_text
             self.history.append("%s（第 %d 局）" % (end_text, self.games))
         record = {"games": self.games, "wins": dict(self.wins),
                   "last": self.last_summary}
+        # 【v0.76】这一局打完，把录像存下来（中止的也存 —— 中止往往才是最想复盘的）。
+        #   `record=False` 时跳过（试玩台可以关掉自动落盘，手动「⭳ 录像」仍然能用）。
+        if self.record:
+            self._save_replay(game)
 
         # 【v0.15】结束消息带上"谁赢了"和最终场面：前端要拿它渲染结束面板，
         #   光有一段中文文本，界面只能反过来解析字符串。老客户端只读 text。
@@ -864,6 +1184,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._file("style.css")
         if path == "/api/host/status":
             return self._json(self.room.status())
+        # 【v0.76】导出这一局的录像（回放包）。前端拿到后自己存成 .json 文件。
+        if path == "/api/host/replay":
+            g = getattr(self.room, "game", None)
+            if g is None:
+                return self._json({"ok": False, "err": "这一局还没开始"})
+            data = g.replay_dict()
+            if data is None:
+                return self._json({"ok": False, "err": "这一局没有开录制"})
+            return self._json({"ok": True, "data": data})
         if path == "/api/host/events":
             return self._sse()
         self.send_error(404)
@@ -888,6 +1217,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 _as_int(body.get("start_seeds"), 0),
                 _as_int(body.get("game_port"), 8080),
                 body.get("rules"))       # 【v0.25】房间规则（脏数据由 normalize_rules 折）
+            return self._json({"ok": ok, "err": err, "status": self.room.status()})
+
+        # 【v0.76】回退：要求把这一局退回本回合开始。
+        #   ★ 这里只是"打个招呼"就返回 —— 真正的动作发生在引擎等答案那一刻。
+        if path == "/api/host/undo":
+            ok, err = self.room.request_undo()
             return self._json({"ok": ok, "err": err, "status": self.room.status()})
 
         if path == "/api/host/stop":

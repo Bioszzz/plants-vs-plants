@@ -130,6 +130,28 @@ class Seat:
         self.bus = Bus()                # webui 的事件总线（缓存状态 + 回放）
         self.bridge = Bridge(self.bus)  # 真正的 TCP 客户端
         self.httpd = None
+        # 【v0.76】回退入口：开局时由 Lab 指向 room.request_undo。
+        #   ★ 用"属性 + 闭包"而不是直接传函数：座位页的 HTTP 服务是【一次建好、
+        #     一直常驻】的（见类注释），类属性在建立那一刻就固化了，而
+        #     "这一局能不能回退"要等开局之后才知道 —— 所以得让它运行时再取。
+        self.undo_hook = None
+        # 【v0.76】导出录像的入口，同样开局时才接上。
+        self.replay_hook = None
+
+    def _undo_request(self, at=None):
+        fn = self.undo_hook
+        if fn is None:
+            return False, "还没开局，没有可回退的对局"
+        try:
+            return fn(at)
+        except TypeError:
+            return fn()
+
+    def _replay_request(self):
+        fn = self.replay_hook
+        if fn is None:
+            return None
+        return fn()
 
     def url(self):
         return "http://127.0.0.1:%d/" % self.port
@@ -140,8 +162,16 @@ class Seat:
             "bus": self.bus,
             "bridge": self.bridge,
             "name_ref": self.name_ref,   # 预填名字、且不写 names.json
-            "no_local": True,            # 禁止「本机开一局」（会拆台）
+            # 【v0.76】座位页不显示「玩家选项」（服务器友好 / 自动录像）：
+            #   N 个座位共用一个进程，各存一份录像会让 对局录像/ 里堆 N 份同一局；
+            #   而"服务器友好"在试玩台里也省不到东西（服务和客户端在同一台机器）。
+            #   ★ 另外 no_local 也一并留着：它对应的「本机开一局」已经删了，
+            #     这个类属性现在只是空壳（见 webui.Handler 的注释）。
+            "allow_prefs": False,
+            "no_local": True,
             "session_ref": self.session,  # 【v0.74.1】「再来一局」用本座位自己的记录
+            "undo_ref": self._undo_request,   # 【v0.76】回退（运行时才决定有没有）
+            "replay_ref": self._replay_request,   # 【v0.76】导出录像（同上）
         })
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), cls)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -177,6 +207,7 @@ class Lab:
         self.seats = []
         self.game_port = 0
         self.error = ""
+        self.note = ""          # 【v0.76】"从录像续玩"时的补充说明（模糊匹配到了哪份）
         self._lock = threading.Lock()
 
     # ---------- 座位池 ----------
@@ -209,8 +240,13 @@ class Lab:
         st = self.room.status()
         st["seats"] = self.seats_status()
         st["lab_error"] = self.error
+        st["lab_note"] = self.note
         st["max_seats"] = MAX_SEATS
         st["seat_port_base"] = SEAT_PORT_BASE
+        # 【v0.76】这一局是不是"从录像续玩"（页面据此显示一行提示）
+        st["resume"] = bool(getattr(self.room, "resume", None))
+        # 【v0.76】录像要不要自动落盘（页面用它回填勾选框，刷新后不会变回默认）
+        st["record"] = bool(getattr(self.room, "record", True))
         # ★ 规则元数据本来就在 room.status() 里（rule_options / rules_default），
         #   配置页照它动态生成勾选框 —— 加一条规则只改 plants_data.RULE_OPTIONS。
         return st
@@ -227,15 +263,24 @@ class Lab:
 
     # ---------- 开局 ----------
     def start(self, total=3, bots=0, start_seeds=0, game_port=0,
-              rules=None, names=None, open_tabs=True):
+              rules=None, names=None, open_tabs=True, resume=None,
+              record=True):
         with self._lock:
             if self.room.state in ("waiting", "playing"):
                 return False, "已经有一局在跑了，先「停止」"
+        self.note = ""
         total = _as_int(total, 3)
         bots = _as_int(bots, 0)
         start_seeds = max(0, _as_int(start_seeds, 0))
         game_port = _as_int(game_port, 0)
         rules = normalize_rules(rules)          # 与 netserver 同一套折叠口径
+        # 【v0.76】续玩：人数 / 种子 / 规则一律以录像为准 —— 少一个都会跑出另一局。
+        if isinstance(resume, dict):
+            if not isinstance(resume.get("rng_seed"), int):
+                return False, "这份录像没记下随机种子，没法续玩（请用新版本重新导一份）"
+            total = _as_int(resume.get("players"), total)
+            start_seeds = max(0, _as_int(resume.get("start_seeds"), start_seeds))
+            rules = normalize_rules(resume.get("rules") or {})
         if total < 2:
             return False, "人数至少 2 人"
         if bots < 0 or bots > total:
@@ -272,12 +317,19 @@ class Lab:
         for s in self.seats:
             s.bridge.disconnect(notify=True)
 
-        ok, err = self.room.start(total, bots, start_seeds, game_port, rules)
+        ok, err = self.room.start(total, bots, start_seeds, game_port, rules,
+                                  resume=resume if isinstance(resume, dict) else None,
+                                  record=bool(record))
         if not ok:
             self.error = err
             self._emit()
             return False, err
         self.game_port = game_port
+        # 【v0.76】开局成功 → 把「回退」「导出录像」接到这个 Room 上。
+        #   失败时保持 None（座位页点它们只会得到"还没开局"）。
+        for s in self.seats:
+            s.undo_hook = self.request_undo     # ★ 走 Lab：局内 / 局终两种都能接
+            s.replay_hook = self._current_replay
 
         # ---- 串行连接：连接顺序 = 座位号 ----
         # ★ 必须串行。并发连的话谁先被 accept 谁就是 1 号位，标签页和座位号
@@ -308,6 +360,81 @@ class Lab:
         if open_tabs:
             threading.Thread(target=open_seat_tabs, args=(seats,), daemon=True).start()
         return True, None
+
+    def request_undo(self, at=None):
+        """【v0.76】座位页按「回退」的总入口。
+
+        · 对局进行中 → 直接交给 Room（引擎在等答案处抛 UndoRequest，同一条连接）。
+        · 已经打完 → Room 会说"没有正在进行的对局"。这时走"局终回退"：
+          把刚打完那一局的录像截断成"续玩前缀"塞进 room.resume，
+          再把各座位连回去 —— 服务端在局末已经把 socket 关了，必须重连。
+        """
+        ok, err = self.room.request_undo(at)
+        if ok:
+            return ok, err
+        g = getattr(self.room, "game", None)
+        if g is None or not getattr(g, "record", None):
+            return False, err                 # 原样透出"现在没有正在进行的对局"
+        # 只认"确实打完了一局"：从头开的房间 games==0，那时按回退不该动上一局的录像。
+        if int(getattr(self.room, "games", 0) or 0) < 1:
+            return False, err
+
+        last_round = int(getattr(g, "round", 0) or 0)
+        target = last_round
+        if isinstance(at, str) and at.strip().lower() in ("prev", "-1", "上一回合"):
+            target = max(0, last_round - 1)
+        else:
+            n = _as_int(at, None)
+            if n is not None:
+                target = max(0, min(n, last_round))
+
+        rec = self._truncate_record(g, target)
+        if rec is None:
+            return False, "这一局没有可回退的录像（种子缺失）"
+        with self.room._lock:
+            self.room.resume = rec
+        self.room.rewind_stats()              # 那一局已经记进战绩了，先撤回来
+        ok2, err2 = self._reconnect_seats()
+        if not ok2:
+            with self.room._lock:
+                self.room.resume = None       # 没连成 → 别把"续玩前缀"留给下一局
+            return False, err2
+        self._emit()
+        return True, None
+
+    def _truncate_record(self, g, target):
+        """把一局的录像截成"第 target 回合开始之前"能用的续玩前缀。"""
+        import replay as _replay
+        return _replay.truncate_record(g, target)
+
+    def _reconnect_seats(self):
+        """把真人座位按顺序连回房间（局终回退专用：服务端局末关过 socket）。"""
+        port = int(self.game_port or 0)
+        if not port:
+            return False, "不知道上一局的游戏端口"
+        humans = max(1, int(self.room.total) - int(self.room.bots))
+        for s in self.seats[:humans]:
+            s.bridge.disconnect(notify=False)
+            ok, err = s.bridge.connect("127.0.0.1", port, retry=6.0)
+            if not ok:
+                return False, "座位 %d 重连失败：%s" % (s.idx, err)
+            s.bridge.send_name(s.name)
+            s.session.update({"mode": "lab", "host": "127.0.0.1", "port": port,
+                              "name": s.name})
+        return True, None
+
+    def _current_replay(self):
+        """把"到目前为止"的录像交给页面导出（中途也能导，能重放到同一处）。
+
+        ★ 这个方法必须待在 start_game【之外】——
+          上次它被插进 start_game 中间，导致该方法在那里就结束了，
+          后面「串行连接 + 打开标签页」全变成这里 return 之后的死代码：
+          点「一键开局」不弹网页、座位显示"未连接"（用户 2026-11-15 报的就是这个）。
+        """
+        g = getattr(self.room, "game", None)
+        if g is None:
+            return None
+        return g.replay_dict()
 
     # ---------- 停止 ----------
     def stop(self):
@@ -393,6 +520,31 @@ class LabHandler(BaseHTTPRequestHandler):
             return self._file("style.css")
         if path == "/api/lab/status":
             return self._json(self.lab.status())
+        # 【v0.76】可选录像列表（"从录像续玩"用）。只给名字/大小/时间，够选就行。
+        if path == "/api/lab/replays":
+            import replay as _replay
+            items = []
+            for mt, name, full in _replay.find_replays()[:40]:
+                if name == "进行中.json":
+                    continue            # 半截的自动保存在这里没意义
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = 0
+                # 人数 / 回合 / 种子也带上：页面据此把人数格子调成录像的，
+                #   ★ 不然"选了 4 人录像、表里还是 3 人"→ 开出来的网页数对不上（用户 2026-11-16 报）。
+                players = rounds = seeds = None
+                try:
+                    d = _replay.load(full)
+                    players = int(d.get("players") or 0) or None
+                    seeds = int(d.get("start_seeds") or 0)
+                    rows = d.get("answers") or []
+                    rounds = max([r.get("r", 0) for r in rows] or [0]) or None
+                except (OSError, ValueError, TypeError):
+                    pass
+                items.append({"name": name, "size": size, "mtime": int(mt),
+                              "players": players, "rounds": rounds, "seeds": seeds})
+            return self._json({"ok": True, "items": items})
         if path == "/api/lab/events":
             return self._sse()
         self.send_error(404)
@@ -403,11 +555,31 @@ class LabHandler(BaseHTTPRequestHandler):
         body = self._read_json()
 
         if path == "/api/lab/start":
+            # 【v0.76】replay = 录像文件名（可只写片段）；给了就"从那儿续玩"。
+            resume = None
+            _note = ""
+            want = str(body.get("replay") or "").strip()
+            if want:
+                import replay as _replay
+                full, _note = _replay.resolve_path(want)
+                if full is None:
+                    return self._json({"ok": False, "err": _note, "status": self.lab.status()})
+                try:
+                    resume = _replay.load(full)
+                except (OSError, ValueError) as e:
+                    return self._json({"ok": False, "err": "录像读不出来：%s" % e,
+                                       "status": self.lab.status()})
             ok, err = self.lab.start(
                 body.get("total"), body.get("bots"),
                 body.get("start_seeds"), body.get("game_port"),
                 body.get("rules"), body.get("names"),
-                open_tabs=body.get("open_tabs", True) is not False)
+                open_tabs=body.get("open_tabs", True) is not False,
+                resume=resume,
+                # 【v0.76】自动保存录像：没传就按"开"（老前端只发前面几个字段）
+                record=body.get("record", True) is not False)
+            if ok and _note:
+                self.lab.note = _note
+                self.lab._emit()
             return self._json({"ok": ok, "err": err, "status": self.lab.status()})
 
         if path == "/api/lab/stop":

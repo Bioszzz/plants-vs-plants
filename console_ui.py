@@ -427,3 +427,10 @@ class ConsoleController(SyncController):
             if s.isdigit() and 2 <= int(s) <= len(candidates) + 1:
                 return ("revive", candidates[int(s) - 2])
             print("    范围 1~%d，请重新输入。" % (len(candidates) + 1))
+
+if __name__ == "__main__":
+    # 这个文件是【界面模块】，不是能直接跑的程序 —— 直接执行它只会 import 完
+    # 就退出，看起来像卡住了。给一句人话，别让人对着黑屏猜。
+    print("console_ui.py 不是一个能单独运行的程序（它是热座版用的界面模块）。")
+    print("想开一局：  python main.py        看用法：python main.py -h")
+    print("想多开座位：python playtest.py")

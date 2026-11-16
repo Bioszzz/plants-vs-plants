@@ -234,3 +234,57 @@ def get(name):
 def missing(playable):
     """哪些可玩植物还没写文案 —— 给 --check 用。"""
     return [n for n in playable if n not in CODEX_TEXT]
+
+
+# ==========================================================
+# 【v0.76】覆盖层：让图鉴页面能改文案，而不用动这个 .py
+# ----------------------------------------------------------
+# 为什么不在 UI 里回写 codex_text.py：
+#   回写源码会碰上编码（GBK / UTF-8）、换行、缩进、引号转义，
+#   而且 git diff 会变成整文件重写 —— 一旦开始，这个仓库就管不住了。
+#
+# 所以分两层：
+#   默认值      = 本文件里的 CODEX_TEXT（跟版本走，永远完整）
+#   改动        = 旁边的 图鉴文案.json（只存改过的字段）
+#   merged()    = 两者合并后的结果，页面读的是它
+#
+# ★ 覆盖层是【可选】的：文件不存在 / 坏了 / 是空对象 → 一律退回默认值。
+#   所以发到玩家手里的包里没有这个 json 也照样工作，一行都不用改。
+# ★ 这个 json【不进打包清单】，也不进公开库 —— 它是作者的编辑器产物。
+# ==========================================================
+import io as _io
+import json as _json
+import os as _os
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+OVERRIDE_PATH = _os.path.join(_HERE, "图鉴文案.json")
+FIELDS = ("flavor", "story")
+
+
+def read_override():
+    """读覆盖层。任何异常都当"没有改动"——绝不让一个坏文件把图鉴搞挂。"""
+    try:
+        with _io.open(OVERRIDE_PATH, "r", encoding="utf-8") as f:
+            d = _json.load(f)
+        if not isinstance(d, dict):
+            return {}
+        return {k: v for k, v in d.items() if isinstance(v, dict)}
+    except (OSError, ValueError):
+        return {}
+
+
+def merged():
+    """默认值 + 覆盖层。页面（/api/codex-text）读的是这一份。"""
+    out = {k: dict(v) for k, v in CODEX_TEXT.items()}
+    for key, patch in read_override().items():
+        cur = out.setdefault(key, {})
+        for f in FIELDS:
+            v = patch.get(f)
+            if isinstance(v, str):
+                cur[f] = v
+    return out
+
+
+def changed_keys():
+    """哪些株的文案被改过 —— 给 --check / 页面提示用。"""
+    return sorted(read_override().keys())

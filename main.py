@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 《植物斗争》Python 样品入口（多人热座）
-运行：python main.py
-联机版请用 netserver.py + netclient.py / webui.py（【v0.68】起没有图形客户端了）。
-规则与样品采用的解释见 游戏规则总结.txt。
+
+用法：
+    python main.py                 开一局热座（一台电脑轮流操作，边问边配）
+    python main.py -h              看这段说明
+
+它问什么：玩家人数 → 每个座位是人类还是电脑 → 开局种子 → 房间规则。
+想一次配好、开多个真人对打，用 `python playtest.py`（多开试玩台）；
+想联机，用 `python netserver.py` + `python webui.py`。
+
+规则见 `规则（现有）.md`，名词见 `名词表.md`。
 """
+import sys
+
 from bots import BotController
 from console_ui import ConsoleController
 from engine import Game
@@ -40,7 +49,7 @@ def main():
     #   ★★【v0.52】改成【按 RULE_OPTIONS 动态提问】。老写法是这里手写两行
     #     （丝瓜不封顶 / 充能前缀可变）；v0.49 加"丝瓜万岁"、v0.51 加"生命之神"
     #     时都忘了往这里补 —— 于是热座版**根本开不了那两条**，而
-    #     《可选规则集.txt》第四节还写着"四个入口都支持"。这是典型的
+    #     《可选规则集.md》第四节还写着"四个入口都支持"。这是典型的
     #     "界面各写一份元数据"导致的漂移，正解同上：以后加规则只动数据层。
     #   ★ 回车 = 取该项的**默认值**（不是一律"关"）—— mult_cap 这种反向开关
     #     默认值非 0，写死"回车=关"会把默认封顶 3 层变成不封顶。
@@ -62,4 +71,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__.strip())
+        sys.exit(0)
     main()

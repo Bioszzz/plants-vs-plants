@@ -149,7 +149,10 @@ function renderSeats(seats) {
 /* ---------- 状态 ---------- */
 function applyStatus(st) {
   if (!st) return;
+  const _prevState = STATUS.state;
   STATUS = Object.assign(STATUS, st);
+  // 【v0.76】局刚打完 → 刷新"从录像续玩"的候选（新的那份录像这时才落盘）
+  if (st.state === 'ended' && _prevState !== 'ended') loadReplays();
   if (st.rule_options) ensureRules(st.rule_options, st.rules_default);
 
   const busy = (st.state === 'waiting' || st.state === 'playing');
@@ -179,7 +182,7 @@ function applyStatus(st) {
   $('btn-start').disabled = busy;
   $('btn-stop').disabled = !busy;
   $('btn-open').disabled = !seats.length;
-  ['f-total', 'f-bots', 'f-seeds', 'f-port'].forEach(id => { $(id).disabled = busy; });
+  ['f-total', 'f-bots', 'f-seeds', 'f-port', 'f-record'].forEach(id => { $(id).disabled = busy; });
   $('f-names').querySelectorAll('input').forEach(i => { i.disabled = busy; });
   RULE_OPTIONS.forEach(o => {
     const cb = $('f-rule-' + o.key);
@@ -206,6 +209,11 @@ function fillForm(st) {
                             : (c.seeds != null ? c.seeds : (st.start_seeds || 0));
   $('f-port').value = busy ? (st.game_port || 0)
                            : (c.port != null ? c.port : 0);
+  // 【v0.76】自动录像：局在跑时以服务端为准，否则用上次配的（没配过 = 开）。
+  if ($('f-record')) {
+    $('f-record').checked = busy ? (st.record !== false)
+                                 : (c.record != null ? !!c.record : true);
+  }
   // 局在跑的时候名字以服务端真实座位名为准（刷新页面后不会显示成另一批名字）
   renderNames(busy && st.seats ? st.seats.map(s => s.name) : null);
 }
@@ -232,9 +240,51 @@ function snapshot() {
     seeds: Math.max(0, int($('f-seeds').value, 0)),
     port: Math.max(0, int($('f-port').value, 0)),
     names: Array.from($('f-names').querySelectorAll('input')).map(i => i.value.trim()),
-    rules: ruleToggles()
+    rules: ruleToggles(),
+    replay: ($('f-replay') ? $('f-replay').value : ''),
+    // 【v0.76】打完要不要自动存录像（内存录制永远开，回退靠它）
+    record: $('f-record') ? !!$('f-record').checked : true
   };
 }
+
+/* 【v0.76】"从录像续玩"的可选项：对局录像/ 里的文件，新的在前。 */
+let REPLAYS = [];
+function loadReplays() {
+  const sel = $('f-replay');
+  if (!sel) return;
+  fetch('/api/lab/replays').then(r => r.json()).then(d => {
+    const keep = sel.value;
+    REPLAYS = d.items || [];
+    sel.innerHTML = '<option value="">（不续玩，正常开局）</option>';
+    REPLAYS.forEach(it => {
+      const o = document.createElement('option');
+      o.value = it.name;
+      const meta = [];
+      if (it.players) meta.push(it.players + ' 人局');
+      if (it.rounds) meta.push('第 ' + it.rounds + ' 回合');
+      meta.push(Math.round((it.size || 0) / 1024) + ' KB');
+      o.textContent = it.name + '　' + meta.join(' · ');
+      sel.appendChild(o);
+    });
+    if (keep) sel.value = keep;
+  }).catch(() => {});
+}
+
+/* 选了录像 → 把人数字段直接改成录像里的，免得"表里 3 人、开出来 4 个网页" */
+function applyReplayToForm() {
+  const sel = $('f-replay');
+  if (!sel || !sel.value) return;
+  const it = REPLAYS.find(x => x.name === sel.value);
+  if (!it) return;
+  if (it.players) {
+    $('f-total').value = it.players;
+    if (int($('f-bots').value, 0) > it.players) $('f-bots').value = 0;
+    renderNames();
+  }
+  if (it.seeds != null) $('f-seeds').value = it.seeds;
+  updateStartLabel();
+}
+if ($('f-replay')) $('f-replay').onchange = applyReplayToForm;
 
 $('btn-start').onclick = () => {
   const s = snapshot();
@@ -242,7 +292,20 @@ $('btn-start').onclick = () => {
   saveCache(s);                        // 记住这次配的，下次打开自动带出
   post('/api/lab/start', {
     total: s.total, bots: s.bots, start_seeds: s.seeds,
-    game_port: s.port, rules: ruleValues(), names: s.names
+    game_port: s.port, rules: ruleValues(), names: s.names,
+    replay: s.replay, record: s.record
+  }).then(d => {
+    // ★【v0.76】开局成功 → 用服务端的真实参数回填表单。
+    //   续玩时人数/种子是录像说了算，不回填的话"再点一次开局"会按旧数字开网页，
+    //   开出来的网页数和实际座位数对不上（用户 2026-11-16 报的正是这个）。
+    if (!d || !d.ok || !d.status) return;
+    const st = d.status;
+    if (st.total) $('f-total').value = st.total;
+    if (st.bots != null) $('f-bots').value = st.bots;
+    if (st.start_seeds != null) $('f-seeds').value = st.start_seeds;
+    if (st.game_port) $('f-port').value = st.game_port;
+    renderNames(st.seats ? st.seats.map(x => x.name) : null);
+    updateStartLabel();
   });
 };
 
@@ -282,6 +345,7 @@ function connectSSE() {
 }
 
 /* ---------- 启动 ---------- */
+loadReplays();      // 【v0.76】"从录像续玩"的候选清单
 fetch('/api/lab/status').then(r => r.json()).then(applyStatus).catch(() => {});
 connectSSE();
 

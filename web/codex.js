@@ -16,6 +16,12 @@
 
   var CATALOG = [];          // [{name, no, desc, ...}]，按编号排好序
   var TEXT = {};             // {name: {flavor, story}}
+  // 【v0.76】编辑文案 —— 只有私有仓库的图鉴服务才有后端（codex_edit.py）。
+  //   玩家手里的包没有那个文件 → /api/codex-edit/state 直接 404 → EDITABLE 保持 false，
+  //   页面连"编辑"两个字都不会出现。
+  var EDITABLE = false;
+  var EDITING = null;        // 正在编辑哪一株（null = 没在编辑）
+  var CHANGED = {};          // 被改过的株 → 列表上打个小点
   var CUR = null;            // 当前选中的植物名
   var Q = '';
 
@@ -46,7 +52,10 @@
   function load() {
     var done = 0, failed = '';
     function finish() {
-      if (++done < 2) return;
+      // 【v0.76】从 2 个请求变成 3 个：多了「能不能编辑」那一查。
+      //   它不参与失败判定（查不到就是只读，不影响看图鉴），但要等它回来
+      //   再渲染列表 —— 否则"改过"的小圆点会晚一步才出现。
+      if (++done < 3) return;
       if (failed) {
         $('codex-detail').innerHTML = '<div class="cx-empty">读不到图鉴数据：' + esc(failed) + '</div>';
         $('codex-count').textContent = '载入失败';
@@ -75,6 +84,21 @@
       finish();
     }).catch(function (e) {
       failed = 'codex-text：' + e; finish();
+    });
+
+    // 【v0.76】编辑能力（只有私有仓库里才有这个后端）
+    fetch('/api/codex-edit/state').then(function (r) {
+      // 玩家手里的包没有编辑后端 → 这个路由直接 404，response.ok 是 false
+      if (!r.ok) throw new Error('readonly');
+      return r.json();
+    }).then(function (j) {
+      EDITABLE = !!(j && j.editable);
+      CHANGED = {};
+      (j && j.changed || []).forEach(function (k) { CHANGED[k] = 1; });
+      finish();
+    }).catch(function () {
+      EDITABLE = false;
+      finish();
     });
   }
 
@@ -150,6 +174,30 @@
          '</div>';
     h += '<div class="cx-chips">' + chips(p) + '</div>';
 
+    // 【v0.76】编辑态：两段原文换成输入框
+    if (EDITABLE && EDITING === p.name) {
+      h += '<div class="cx-edit">' +
+             '<div class="cx-edit-h">改这一株的文案 ' +
+               '<span class="cx-edit-tip">（保存会写进 图鉴文案.json，不动 codex_text.py）</span>' +
+             '</div>' +
+             '<label class="cx-edit-l">风味（一句吐槽）' +
+               '<textarea id="cx-e-flavor" rows="2" spellcheck="false">' +
+                 esc(t.flavor || '') + '</textarea></label>' +
+             '<label class="cx-edit-l">档案（背景 / 彩蛋）' +
+               '<textarea id="cx-e-story" rows="6" spellcheck="false">' +
+                 esc(t.story || '') + '</textarea></label>' +
+             '<div class="cx-edit-btns">' +
+               '<button class="btn primary" id="cx-save">保存</button>' +
+               '<button class="btn" id="cx-reset">撤回（回到默认）</button>' +
+               '<button class="btn" id="cx-cancel">取消</button>' +
+               '<span class="cx-edit-msg" id="cx-msg"></span>' +
+             '</div>' +
+           '</div>';
+      $('codex-detail').innerHTML = h;
+      bindEditor(p);
+      return;
+    }
+
     if (t.flavor) {
       h += '<div class="cx-flavor">「' + esc(t.flavor) + '」</div>';
     } else {
@@ -168,7 +216,84 @@
            '</div>';
     }
 
+    if (EDITABLE) {
+      var tag = CHANGED[p.name] ? ' <span class="cx-dot" title="改过"></span>' : '';
+      h += '<div class="cx-edit-bar">' +
+             '<button class="btn" id="cx-edit-on">✎ 改这两段</button>' + tag +
+           '</div>';
+    }
+
     $('codex-detail').innerHTML = h;
+    if (EDITABLE && $('cx-edit-on')) {
+      $('cx-edit-on').onclick = function () { EDITING = p.name; renderDetail(p); };
+    }
+  }
+
+  /* ---------- 【v0.76】编辑：保存 / 撤回 / 取消 ---------- */
+  function apiPost(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function bindEditor(p) {
+    var msg = $('cx-msg');
+    function show(s, bad) { if (msg) { msg.textContent = s; msg.className = 'cx-edit-msg' + (bad ? ' bad' : ''); } }
+    function lock(b) {
+      ['cx-save', 'cx-reset', 'cx-cancel'].forEach(function (id) {
+        var el = $(id); if (el) el.disabled = b;
+      });
+    }
+
+    $('cx-save').onclick = function () {
+      lock(true); show('保存中……');
+      apiPost('/api/codex-edit/save', {
+        key: p.name,
+        flavor: $('cx-e-flavor').value,
+        story: $('cx-e-story').value
+      }).then(function (j) {
+        if (!j.ok) { show(j.err || '保存失败', true); lock(false); return; }
+        TEXT = j.text || TEXT;
+        CHANGED = {};
+        ((j.state && j.state.changed) || []).forEach(function (k) { CHANGED[k] = 1; });
+        EDITING = null;
+        renderList();            // 列表上的小点跟着更新
+        renderDetail(p);
+        var m = $('cx-msg');     // 渲染完是新节点，提示要重新挂
+        if (m) { m.textContent = '已保存'; m.className = 'cx-edit-msg'; }
+      }).catch(function (e) { show('保存失败：' + e, true); lock(false); });
+    };
+
+    $('cx-reset').onclick = function () {
+      lock(true); show('撤回中……');
+      apiPost('/api/codex-edit/reset', { key: p.name }).then(function (j) {
+        if (!j.ok) { show(j.err || '撤回失败', true); lock(false); return; }
+        TEXT = j.text || TEXT;
+        CHANGED = {};
+        ((j.state && j.state.changed) || []).forEach(function (k) { CHANGED[k] = 1; });
+        EDITING = null;
+        renderList();
+        renderDetail(p);
+        var m = $('cx-msg');
+        if (m) { m.textContent = '已回到默认文案'; m.className = 'cx-edit-msg'; }
+      }).catch(function (e) { show('撤回失败：' + e, true); lock(false); });
+    };
+
+    $('cx-cancel').onclick = function () { EDITING = null; renderDetail(p); };
+
+    // Ctrl+Enter 保存（写文案时手不用离开键盘）
+    ['cx-e-flavor', 'cx-e-story'].forEach(function (id) {
+      var el = $(id);
+      if (!el) return;
+      el.onkeydown = function (ev) {
+        if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); $('cx-save').click(); }
+      };
+    });
   }
 
   /* ---------- 选中 ---------- */

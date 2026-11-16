@@ -461,8 +461,25 @@ def plan(base=None):
     return cur, info, has
 
 
+USAGE = """updater.py —— 检查更新 / 自动安装（Gitee 公开发行版）
+
+用法：
+    python updater.py              检查 →（有新版就问一句）→ 下载 → 安装
+    python updater.py --check      只检查：有新版的退出码 1，已最新 0
+    python updater.py --yes  /  -y 不询问，直接装（给脚本 / bat 用）
+    python updater.py --dry-run    只下载 + 校验，绝不覆盖
+    python updater.py -h / --help  看这段说明
+
+它只覆盖 zip 里真实存在的那些文件：names.json、dist/、_backup/ 一律不碰。
+装完必须关掉程序重新打开 —— 现在跑的仍然是旧代码。
+"""
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        return 0
     only_check = "--check" in argv
     assume_yes = "--yes" in argv or "-y" in argv
     dry = "--dry-run" in argv

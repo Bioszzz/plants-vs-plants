@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-netclient.py —— 联机版控制台客户端（复刻你 C++ 客户端的角色）
-用法：python netclient.py [服务端IP] [端口] [名字]
-网页版请用 webui.py（【v0.68】起 gui_client.py 已删除，图形界面走浏览器）。
+netclient.py —— 联机版控制台客户端（在终端里玩，没有图形界面）
+
+用法：
+    python netclient.py                    连本机 127.0.0.1:8080
+    python netclient.py 1.2.3.4            连这个地址的 8080
+    python netclient.py 1.2.3.4 8091       连指定地址 + 端口
+    python netclient.py 1.2.3.4 8091 阿甲   顺手报个名字（战报里显示"阿甲(2号)"）
+    python netclient.py -h                 看这段说明
+
+★ 端口最容易填错：房主控制台默认的游戏端口是 **8091**，不是 8080。
+  端口以房主页面上那个「游戏端口」为准。
+★ 想要图形界面请用 `python webui.py`（浏览器里玩）—— 这个只适合在终端里打。
 """
 
 import queue
@@ -14,6 +23,9 @@ import netproto
 
 
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__.strip())
+        return 0
     ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
     # 【v0.35】可选第 3 个参数 = 名字。连上立刻报给服务端（报到消息，

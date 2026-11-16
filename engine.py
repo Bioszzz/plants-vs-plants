@@ -797,10 +797,67 @@ class Teams:
         return out
 
 
+# ==========================================================
+# 【v0.76】回放包的答案编解码
+# ----------------------------------------------------------
+# 答案里混着 Player 对象（"打谁"这一问直接返回 Player，不是编号），
+# JSON 存不下 —— 统一折成编号，回放时再按编号查回对象。
+# ★ 为什么不直接 pickle 整个 Game 当快照：引擎里大量用 `id(植物对象)`
+#   当字典键（absorb_target_plans 等十几处），反序列化后 id 全变，
+#   那些表会静默失配 —— 不报错、只是行为悄悄变了。
+#   所以走"记输入 → 重跑"，而不是"存状态 → 还原"。
+# ==========================================================
+_MISSING = object()
+
+
+class UndoRequest(Exception):
+    """【v0.76】玩家请求把这一局退回去（手抖了 / 想换个打法）。
+
+    ★ 为什么用异常：引擎是"一条道跑到黑"的顺序流程，唯一的合法打断点就是
+      **等答案**那一刻（gather 的轮询循环）。在那里抛出去，调用方（netserver）
+      就能接住、用录像前 N 条重建一局、快进回原处，然后把控制权还给玩家。
+      除此之外的任何地方打断，都会留下半结算的烂摊子。
+    """
+
+    def __init__(self, at=None):
+        super().__init__("undo")
+        self.at = at        # None = 退回到"本回合开始之前"（由调用方算）
+
+
+def answer_out(v):
+    """答案 → 可 JSON 化的形式。Player → 编号；列表逐项折；其余原样。"""
+    if isinstance(v, Player):
+        return {"p": v.idx}
+    if isinstance(v, (list, tuple)):
+        return [answer_out(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): answer_out(x) for k, x in v.items()}
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    # 兜底：不静默丢弃，留一份 repr 好定位（新增决策类型时这里会先炸出来）
+    return {"repr": repr(v)}
+
+
+def answer_in(v, players):
+    """回放时把编号查回 Player。players = Game.players（按 idx-1 索引）。"""
+    if isinstance(v, dict):
+        if "p" in v:
+            i = v.get("p")
+            if isinstance(i, int) and 0 < i <= len(players):
+                return players[i - 1]
+            return None
+        if "repr" in v:
+            return None
+        return {k: answer_in(x, players) for k, x in v.items()}
+    if isinstance(v, list):
+        return [answer_in(x, players) for x in v]
+    return v
+
+
 class Game:
     def __init__(self, controllers, playable=None, output=None, duel_auto=True,
                  rng=None, observers=None, start_seeds=0, rules=None,
-                 player_names=None):
+                 player_names=None, rng_seed=None):
         self.controllers = list(controllers)
         # 【v0.35】玩家名（进房时自己起的）：按 idx 顺序给；缺的一律退回 playerN。
         #   ★ 名字只是【显示名】，引擎里认人一律用 idx —— 两个人都叫"小明"
@@ -826,8 +883,42 @@ class Game:
         # 【v0.21】随机源：只用在"同一个噬魂植物抢同一个目标"时的先后顺序上。
         #   为什么做成 Game 的成员而不是直接 random.shuffle：测试要可复现 ——
         #   传一个 random.Random(0) 进来，随机顺序就固定了（见 Test56）。
-        self.rng = rng if rng is not None else random.Random()
+        # 【v0.76】录制/复现：**种子的来源必须留痕**，否则"同一局重跑"拿到的是
+        #   另一串随机顺序（噬魂抢目标的先后），回放出来跟原局对不上。
+        #   · 调用方传了 Random 对象（测试固定 Random(7)）→ 拿不到它的 seed，
+        #     记 None；回放时由调用方再传同一个 rng。
+        #   · 没传（正式对局）→ 自己生成一个并记下来，写进回放包。
+        self.rng_seed = None
+        # 【v0.76】★ 显式给种子时以它为准：重建一局（回退 / 重放）必须把同一个种子
+        #   带回来，否则"同一串输入"会跑出另一个局面。
+        #   ★ 踩过的坑：netserver 那边是"传一个 Random(seed) 对象进来"，
+        #     而对象里拿不到 seed → 录进录像的 rng_seed 是 None →
+        #     这份录像永远重放不出来（用新的随机数跑，第 6 条答案就对不上了）。
+        if rng_seed is not None:
+            self.rng_seed = int(rng_seed)
+            self.rng = rng if rng is not None else random.Random(self.rng_seed)
+        elif rng is None:
+            self.rng_seed = random.randrange(1 << 30)
+            self.rng = random.Random(self.rng_seed)
+        else:
+            self.rng = rng
         self.round = 0
+        # 【v0.76】录制：None = 不录（老路径行为一字不变）；dict = 边打边记。
+        #   记的是"每一次 gather 收到了什么答案"—— 导出、复现、回溯全靠它。
+        self.record = None
+        # 当前处在哪个阶段，只用于把录像切段（回退时按"回合 + 阶段"定位）。
+        self._phase = ""
+        # 【v0.76】回退请求：有人按了「回退」就置上，等下一个 gather 轮询时抛出去。
+        self.undo_at = None
+        # 【v0.76】每回合结束的回调（可选）——服务端拿它做"中途自动保存"。
+        #   签名 f(game)。★ 回调里抛的异常会被吞掉：存录像失败绝不许影响对局，
+        #   这条和"战报播不出来不许挡住结算"是同一个道理。
+        self.on_round_end = None
+        # 【v0.76】每收一批答案的回调（可选）——签名 f(新增的答案行列表)。
+        #   服务端用它做"服务器友好"：把增量答案推给自算战报的客户端。
+        #   ★ 只有【真正新记下来的】行才会进参数；回退快进时背出来的历史
+        #     答案（_record_skip）不算新增 —— 否则客户端会把同一批复读一遍。
+        self.on_answers = None
         # 【v0.22】开局种子：全场统一发牌（房主在控制台上定的那个数）。
         #   为什么放在这里（建完 Player、任何阶段之前）：这是"发牌"，不是回合行为 ——
         #   与 phase_choose 里出牌扣种是两码事，别混在一起。
@@ -1663,6 +1754,9 @@ class Game:
         pending = list(questions)
         answers = {}
         while pending:
+            # 【v0.76】有人按了「回退」→ 就在这里停住（等答案是唯一合法打断点）。
+            if self.undo_at is not None:
+                raise UndoRequest(self.undo_at)
             for q in list(pending):
                 v = self.controllers[q.player_idx - 1].poll()
                 if v is PENDING:
@@ -1671,7 +1765,100 @@ class Game:
                 pending.remove(q)
             if pending:
                 time.sleep(POLL_INTERVAL)
+        # 【v0.76】把这一批"谁答了什么"记进录像（没开录制时一行不跑）。
+        if self.record is not None:
+            self._note_answers(questions, answers)
         return answers
+
+    # ---------- 【v0.76】录制 ----------
+    def start_record(self, carry=None):
+        """开始录制这一局。之后每次 gather 的答案都会记进 self.record。
+
+        ★ 录的是"输入"，不是"状态"：回合 + 阶段 + 谁 + 答了什么。
+          回合、场面、发牌全由引擎重跑时自己长出来 —— 只要引擎是确定性的
+          （同一个 rng 种子 + 同一串输入 → 同一份战报，已实测跨进程逐字一致）。
+
+        carry：回退重建时把"保留的历史答案"带过来（见 _record_skip）。
+        """
+        self.record = {
+            "players": len(self.players),
+            "names": [p.name for p in self.players],
+            "start_seeds": self.start_seeds,
+            "rules": dict(self.rules),
+            "rng_seed": self.rng_seed,
+            # duel_auto 也要记：它会改变"问不问释放/指定目标"，漏了重放就对不上
+            "duel_auto": self.duel_auto,
+            # 【v0.76】牌库也记：本局用了哪 38 株（试玩台/测试会用另一套）。
+            #   不记的话，拿默认牌库重放一局"当时用了别的牌库"的录像，
+            #   候选一变，同一个答案编号就指向另一个人 —— 会安静地跑出另一局。
+            "playable": list(self.playable),
+            "answers": [dict(r) for r in (carry or [])],
+        }
+        # 【v0.76】回退重建时，前 N 条是"快进背出来的历史答案"——
+        #   它们已经在 carry 里了，_note_answers 不许再记一遍。
+        #   ★ 不设这个跳过计数的话，每回退一次录像就翻一倍（10 → 20 → 40 …），
+        #     而快进又被喂了翻倍的答案 → 回合数 1-2-4-8 地往后跳。
+        self._record_skip = len(carry or [])
+        return self.record
+
+    def _note_answers(self, questions, answers):
+        lst = self.record["answers"]
+        skip = getattr(self, "_record_skip", 0)
+        fresh = []
+        for q in questions:
+            if skip > 0:
+                skip -= 1          # 这条是快进重放的，已经在 carry 里记过了
+                continue
+            v = answers.get(q.player_idx, _MISSING)
+            row = {"r": self.round, "ph": self._phase, "k": q.kind,
+                   "who": q.player_idx,
+                   "v": None if v is _MISSING else answer_out(v)}
+            if v is _MISSING:
+                row["miss"] = True     # 该答却没答（异常路径，回放时不肯吃）
+            lst.append(row)
+            fresh.append(row)
+        self._record_skip = skip
+        # 【v0.76】增量通知（服务器友好 / 客户端自动录像共用这一条通道）。
+        #   ★ 吞异常：推不到某个客户端绝不许把这一局带崩。
+        hook = self.on_answers
+        if hook is not None and fresh:
+            try:
+                hook(fresh)
+            except Exception:          # noqa: BLE001
+                pass
+
+    def request_undo(self, at=None):
+        """【v0.76】外部（按钮 / HTTP 接口）调用：请在下一个"等答案"处退回去。
+
+        at：退回到【第 at 回合开始】。None = 本回合开始（最常用）；0 = 从开局重来。
+        ★ 只是【打个招呼】。真正的动作发生在 gather 的轮询循环里 ——
+          那里抛 UndoRequest，由调用方接住并重建。
+        """
+        try:
+            target = int(at) if at is not None else int(self.round)
+        except (TypeError, ValueError):
+            target = int(self.round)
+        if target < 0:
+            target = 0
+        if target > self.round:
+            target = int(self.round)      # 不许"退"到还没走到的回合
+        self.undo_at = target
+        return True
+
+    def replay_dict(self):
+        """打包成可 JSON 的回放包。没开录制 → None。"""
+        if self.record is None:
+            return None
+        d = dict(self.record)
+        d["format"] = "pvsp-replay/1"
+        d["rules"] = dict(self.record.get("rules") or {})
+        d["answers"] = list(self.record.get("answers") or [])
+        d["final"] = {
+            "round": self.round,
+            "winner": (self.winner.idx if self.winner is not None else None),
+            "winners": [p.idx for p in (self.winners or [])],
+        }
+        return d
 
     def gather_by_batches(self, questions):
         """【v0.70】一批问题里，**同一个答题人只能出现一次** —— 按人轮转分批。
@@ -1712,16 +1899,28 @@ class Game:
             self.round += 1
             self.say("")
             self.say("================ 第 %d 回合 ================" % self.round)
+            # 【v0.76】阶段名只喂给录像，用来把答案切段（回退按"回合+阶段"定位）。
+            self._phase = "prep"
             self.phase_prep()
             if self.check_end():
                 break
+            self._phase = "choose"
             self.phase_choose()
+            self._phase = "bluff"
             self.phase_bluff()
+            self._phase = "settle"
             self.phase_settle()
             # 【v0.47】结算完立刻自检：计划表里不许留上一回合的幽灵条目
             #   （本回合刚死的人 field 仍在，不算幽灵 —— 判据见方法注释）。
             self._audit_plans_after_settle()
             self.check_end()
+            # 【v0.76】一回合走完 → 通知外面存一次档（中途崩了还能捞回来）。
+            #   ★ 放在 check_end 之后：最后一回合也要存，否则"打赢了却没录像"。
+            if self.on_round_end is not None:
+                try:
+                    self.on_round_end(self)
+                except Exception:       # noqa: BLE001 —— 见 __init__ 里的说明
+                    pass
         if not self.over:
             self.say("达到 %d 回合上限，判定平局（防止死循环的保护阀）。" % MAX_ROUNDS)
         return self.winner
@@ -1814,15 +2013,14 @@ class Game:
 
     def cost_of(self, spec, player):
         """这一株【现在】要花多少种子。原稿 p37 的 [消耗] 公式：
-            最低消耗 = [基础消耗]×[倍耗率] + [鱼腥味负荷] (+[定居负荷]，未实现)
+            最低消耗 = [基础消耗]×[倍耗率] + [定居]
             [消耗]   = 最低消耗 + [充能消耗] + [其他]
+        ★ [定居] 就是"鱼腥味层数"造成的负荷（原稿那行把这一项写了两遍，其实同一个）。
         ★ 两条顺序（用户 2026-09-21："倍耗在鱼腥味之前"）：
-          先 基础消耗×倍耗率，再 + 鱼腥味 —— 倍耗【不】翻鱼腥味。
+          先 基础消耗×倍耗率，再 + 定居 —— 倍耗【不】翻它。
         ★ 充能在括号【外】、且不参与倍耗（"充能耗种不翻倍"）：
-          人参果基础 0、充能 3、身上 x 鱼腥味 y 倍耗 → 此处只算 0×2y+x 那一半，
-          充能的 3 走 phase_bluff 的充能步骤（单独扣），两步合计 = 3+x。
-        ★ [定居] 那条原稿也有（"非[基石]类消耗种数+n"），但定居机制未实现，
-          落到这里就是【暂时没有那一项】—— 将来加定居时在这里补一个负荷即可。"""
+          人参果基础 0、充能 3、身上 x 定居 y 倍耗 → 此处只算 0×2y+x 那一半，
+          充能的 3 走 phase_bluff 的充能步骤（单独扣），两步合计 = 3+x。"""
         mult, fishy = self.mask_loads(spec, player)
         n = mult
         cap = self.rules.get("mult_cap", 3)

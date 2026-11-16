@@ -36,6 +36,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import codex_text
 import webui
 
+# 【v0.76】编辑后端是【可选模块】——只有私有仓库里有 codex_edit.py。
+#   玩家手里的包没有这个文件 → import 失败 → 图鉴就是纯只读（跟以前一模一样），
+#   页面上一行都不用改。这就是"作者工具不进 release"的实现方式：靠文件缺席。
+try:
+    import codex_edit
+except ImportError:                 # 包里没有 → 只读图鉴
+    codex_edit = None
+
 DEFAULT_PORT = 8400
 PORT_TRY_MAX = 20          # 端口被占用时往后试几个（手机上一个进程一个口，很容易撞）
 
@@ -72,8 +80,15 @@ class CodexHandler(BaseHTTPRequestHandler):
             # 数值 / 机制：与对局界面完全同源
             return self._json(webui.build_catalog())
         if path == "/api/codex-text":
-            # 只是"说法"，不参与任何判定
-            return self._json(codex_text.CODEX_TEXT)
+            # 只是"说法"，不参与任何判定。
+            # 【v0.76】读 merged()：默认文案 + 作者改过的覆盖层（图鉴文案.json）。
+            #   覆盖层不存在时它等价于 CODEX_TEXT 本身。
+            return self._json(codex_text.merged())
+        if path == "/api/codex-edit/state":
+            # 前端据此决定显不显示「编辑」开关
+            if codex_edit is None:
+                return self._json({"editable": False})
+            return self._json(codex_edit.state())
         if path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -81,8 +96,39 @@ class CodexHandler(BaseHTTPRequestHandler):
         return self.send_error(404)
 
     def do_POST(self):
-        # 图鉴是只读的：没有任何接口需要写。明确拒绝，别让人误以为它能改东西。
-        return self.send_error(405)
+        # 【v0.76】图鉴的常态是只读的，写接口只有"编辑文案"这一个，
+        #   而且**只在私有仓库里存在**（靠 codex_edit.py 在不在）。
+        #   没有它 → 仍然是 405，跟以前一字不差。
+        if codex_edit is None:
+            return self.send_error(405)
+        path = self.path.split("?")[0]
+        body = self._read_json()
+
+        if path == "/api/codex-edit/save":
+            ok, err = codex_edit.save(body.get("key"),
+                                      body.get("flavor"),
+                                      body.get("story"))
+            return self._json({"ok": ok, "err": err,
+                               "text": codex_text.merged(),
+                               "state": codex_edit.state()})
+        if path == "/api/codex-edit/reset":
+            ok, err = codex_edit.reset(body.get("key"))
+            return self._json({"ok": ok, "err": err,
+                               "text": codex_text.merged(),
+                               "state": codex_edit.state()})
+        return self.send_error(404)
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
 
     # ---------- 输出 ----------
     def _json(self, obj):

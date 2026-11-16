@@ -429,6 +429,147 @@ class Bus:
 # ======================================================================
 #  本地桥：浏览器 ←→ 远端 netserver
 # ======================================================================
+class Mirror:
+    """【v0.76】本地影子引擎 —— 「服务器友好」和「自动录像」的客户端那半边。
+
+    服务端把「这一局的头部 + 增量答案」推过来，这里在本地把引擎重跑一遍，
+    自己产出战报。于是"服务器友好"真的省掉了服务端的中文战报带宽：
+
+        中文战报 50~300 KB/局   →   答案序列 2~5 KB/局
+
+    顺带也就得到了能存盘的录像（自动录像走的是同一条通道）。
+
+    ★ 为什么是"整段重跑"而不是"增量推进"：`replay.run_replay` 本来就有
+      "答案用完就停下"的能力（ReplayIncomplete），一遍 build + run 就够，
+      不用维护一个长活的 Game 对象和它的线程同步。代价是每收到一批答案
+      要把前面重跑一次 —— 实测每回合几毫秒到几十毫秒，而且在后台线程，
+      玩家感觉不到。
+    ★ 前提：引擎确定性（同一串输入 → 逐字相同的战报）。这个由项目自己保证，
+      也已经实测过跨进程一致。如果玩家私自改了 engine.py，战报会和服务端不同，
+      但那只影响他自己看到的东西。
+    """
+
+    # 攒一小会儿再重跑：一回合里有好几次 gather（出牌 / 释放 / 目标 / 连击分配），
+    # 每批都立刻重跑的话，一回合要跑十遍。
+    COALESCE = 0.12
+
+    def __init__(self, bus):
+        self.bus = bus
+        self._lock = threading.Lock()
+        self.data = None        # 头部 + 累积的答案（None = 这一局还没开始）
+        self.shown = 0          # 已经推给前端多少行战报
+        self.save_file = False  # 「自动录像」：要不要顺手落盘
+        self._timer = None
+
+    # ---------- 收 ----------
+    def reset(self):
+        with self._lock:
+            self.data = None
+            self.shown = 0
+            t, self._timer = self._timer, None
+        if t is not None:
+            t.cancel()
+
+    def head(self, data):
+        """开局 / 回退重建：服务端发来本局的头（人数 / 种子 / 规则 / 牌库）。
+
+        ★ 收到 head 就把本地累积清空重来 —— 回退后旧的那串答案已经作废了。
+        """
+        if not isinstance(data, dict):
+            return
+        with self._lock:
+            d = dict(data)
+            d["answers"] = []
+            self.data = d
+            self.shown = 0
+        self._schedule()
+
+    def rows(self, add):
+        if not add:
+            return
+        with self._lock:
+            if self.data is None:
+                return          # 还没收到 head —— 丢掉，等 head 来了从头算
+            self.data["answers"].extend(add)
+        self._schedule()
+
+    def finish(self):
+        """局末：把最后一批跑完，再（可选）落盘。"""
+        self._flush()
+        if not self.save_file:
+            return
+        nm = self._save(running=False)
+        if nm:
+            self.bus.push({"type": "msg",
+                           "text": "（本局录像已存到 对局录像/%s　重放：python replay.py）" % nm})
+
+    # ---------- 算 ----------
+    def _schedule(self):
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            t = threading.Timer(self.COALESCE, self._flush)
+            t.daemon = True
+            self._timer = t
+        t.start()
+
+    def _snapshot(self):
+        with self._lock:
+            if self.data is None:
+                return None
+            d = dict(self.data)
+            d["answers"] = list(d["answers"])
+            return d
+
+    def _flush(self):
+        with self._lock:
+            t, self._timer = self._timer, None
+        if t is not None:
+            t.cancel()
+        data = self._snapshot()
+        if not data or not data.get("answers"):
+            return
+        try:
+            import replay as _replay
+            _g, lines = _replay.run_replay(data)
+        except Exception as e:      # noqa: BLE001 —— 本地算炸了不能让页面卡死
+            self.bus.push({"type": "msg",
+                           "text": "（本地重算战报出错：%s —— 把「服务器友好」取消勾选，"
+                                   "改由服务器直接发战报）" % e})
+            return
+        with self._lock:
+            start = self.shown
+            self.shown = len(lines)
+        for t2 in lines[start:]:
+            self.bus.push({"type": "msg", "text": str(t2)})
+        if self.save_file:
+            self._save(running=True)
+
+    # ---------- 存 ----------
+    def _save(self, running=False):
+        data = self._snapshot()
+        if not data:
+            return None
+        d = os.path.join(BASE_DIR, "对局录像")
+        try:
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            if running:
+                nm = "客户端_进行中.json"
+            else:
+                nm = "客户端_%s_%d人局.json" % (
+                    time.strftime("%Y%m%d_%H%M%S"), int(data.get("players") or 0))
+            with open(os.path.join(d, nm), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            if not running:
+                busy = os.path.join(d, "客户端_进行中.json")
+                if os.path.isfile(busy):
+                    os.remove(busy)
+            return nm
+        except Exception:          # noqa: BLE001 —— 存不下来不影响对局
+            return None
+
+
 class Bridge:
     """一个浏览器玩家 ←→ 一个远端服务端。
 
@@ -445,6 +586,10 @@ class Bridge:
         self.port = None
         self.idx = None
         self.total = None
+        # 【v0.76】玩家选项（浏览器那边勾的，连接后随时可改）。
+        #   friendly = 服务器友好（自己算战报）；record = 自动录像（另存一份）。
+        self.prefs = {"friendly": False, "record": False}
+        self.mirror = Mirror(bus)
 
     # ---------- 状态 ----------
     def status(self):
@@ -478,6 +623,15 @@ class Bridge:
         threading.Thread(target=self._read_loop,
                          args=(sock, netproto.Reader(sock), cid),
                          daemon=True).start()
+        # 【v0.76】重连之后把玩家选项再报一次 —— 服务端那边是全新的一条连接，
+        #   不记得上一局勾了什么。不补这一下，断线重连就悄悄退回"什么都不要"。
+        if self.prefs["friendly"] or self.prefs["record"]:
+            try:
+                netproto.send_msg(sock, {"type": "prefs",
+                                         "friendly": self.prefs["friendly"],
+                                         "record": self.prefs["record"]})
+            except OSError:
+                pass
         self.bus.push({"type": "conn", "connected": True,
                        "host": host, "port": port})
         return True, None
@@ -502,6 +656,8 @@ class Bridge:
         if notify:
             self.bus.push({"type": "conn", "connected": False,
                            "text": "已断开连接"})
+        # 【v0.76】影子引擎的状态跟着连接一起作废（换一局/换一台服就无意义了）
+        self.mirror.reset()
 
     # ---------- 服务端 → 浏览器 ----------
     def _read_loop(self, sock, reader, cid):
@@ -517,6 +673,25 @@ class Bridge:
                     if cid == self._conn_id:
                         self.idx = m.get("idx")
                         self.total = m.get("total")
+            # 【v0.76】影子引擎的两类消息：只喂本地重算，不往浏览器推
+            #   （浏览器不认识它们，推过去只是白占 SSE 带宽）。
+            if isinstance(m, dict):
+                _t = m.get("type")
+                if _t == "rep_head":
+                    with self._lock:
+                        if cid != self._conn_id:
+                            continue
+                    self.mirror.head(m.get("data") or {})
+                    continue
+                if _t == "rep_rows":
+                    with self._lock:
+                        if cid != self._conn_id:
+                            continue
+                    self.mirror.rows(m.get("rows") or [])
+                    continue
+                if _t == "end":
+                    # 先把最后一批答案算完、战报补齐，再让前端显示结束面板
+                    self.mirror.finish()
             self.bus.push(m)
         # 收尾：只有"当前这条连接"的自然断开才通知前端；
         # 手动断开 / 重连产生的旧线程保持安静，免得界面被过期事件打回去。
@@ -549,6 +724,26 @@ class Bridge:
             return False, "尚未连接服务器"
         try:
             netproto.send_msg(sock, {"type": "answer", "value": value})
+        except OSError as e:
+            return False, "发送失败：%s" % e
+        return True, None
+
+    def send_prefs(self, friendly, record):
+        """【v0.76】把玩家选项报给服务端。中途改也生效（下一批答案起按新设置走）。
+
+        ★ 没连接时也把值记下来：连上那一刻会自动补报（见 connect）。
+          这样"先勾好再连接"和"连上再勾"两种顺序都对。
+        """
+        friendly, record = bool(friendly), bool(record)
+        self.prefs["friendly"], self.prefs["record"] = friendly, record
+        self.mirror.save_file = record
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return True, None        # 记下了，连上再报
+        try:
+            netproto.send_msg(sock, {"type": "prefs",
+                                     "friendly": friendly, "record": record})
         except OSError as e:
             return False, "发送失败：%s" % e
         return True, None
@@ -710,16 +905,29 @@ class Handler(BaseHTTPRequestHandler):
     #   name_ref —— {"name": "真人1"} 这样的可变容器：座位页进房时用它预填名字。
     #     ★ 为什么是字典而不是字符串：名字要能跟着试玩台的配置改。
     #       存成类属性的话，改一次名字就得重建 HTTP 服务（端口跟着变，页面全废）。
-    #   no_local —— 挡掉座位页里的「本机开一局」：那一按会在【试玩台进程里】另起
-    #     一个 netserver 并把本座位连过去，其余座位就被晾在旧局里 —— 在试玩台里
-    #     这是纯粹的破坏行为，所以后端直接拒。
+    #   no_local —— 【v0.76】网页版已不再提供「本机开一局」的入口（被多开试玩台
+    #     整个覆盖了）。这个钉子留着是为了试玩台的座位页：**接口还在**（自动化测试
+    #     拿它当起局夹具），所以座位上仍然不能让人随手点开第二个服务端。
     name_ref = None
     no_local = False
+    # 【v0.76】这个页面允不允许改「玩家选项」（服务器友好 / 自动录像）。
+    #   普通单开 = True；试玩台的座位页 = False（N 个座位共用进程，存 N 份录像没意义）。
+    allow_prefs = True
     # 【v0.74.1】session_ref —— 「上一局是怎么连的」这份记录的容器。
     #   None = 用模块级 SESSION（普通单开就是这样，行为与以前一模一样）。
     #   试玩台会为每座位塞一个自己的 dict：N 个座位共用一个进程，共用一份
     #   SESSION 的话 host/port 还好，但 `name` 会互相覆盖 → 再来一局时报错名字。
     session_ref = None
+    # 【v0.76】undo_ref —— 「回退到本回合开始」的入口。
+    #   None = 这个页面不支持回退（普通单开、本机局都走这条，行为与以前一致）；
+    #   试玩台会塞一个 callable，直接调到进程内那个 Room 的 request_undo。
+    #   ★ 为什么不做成"发个 HTTP 去问 netserver"：本机局的 netserver 是子进程，
+    #     控制台端口是多少、开没开，webui 这边一概不知道。能直连的就直连。
+    undo_ref = None
+    # 【v0.76】replay_ref —— 「导出本局录像」，同样是个 callable（试玩台才有）。
+    #   None = 这个页面不支持导出（普通单开），前端就不显示那个按钮。
+    #   返回 replay_dict() 或 None。
+    replay_ref = None
 
     def _session(self):
         ref = self.session_ref
@@ -775,6 +983,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_names())
         if path == "/api/events":
             return self._sse()
+        # 【v0.76】这两个都是【只读查询】，必须是 GET。
+        # ★★ 上一版把它们写进了 do_POST，而前端用的是 fetch() 的默认 GET ——
+        #    于是 /api/caps 永远 404，前端就认为"这个页面不支持"，两个按钮都不显示。
+        #    （2026-11-15 查试玩台的问题时才发现：写路由时只看了"附近有个 /api/undo"，
+        #      没确认它属于哪个 do_*。）
+        if path == "/api/caps":
+            return self._json({"undo": self.undo_ref is not None,
+                               "replay": self.replay_ref is not None,
+                               # 【v0.76】这个页面要不要显示「玩家选项」。
+                               #   试玩台的座位页为 False —— 那 N 个座位共用一个进程，
+                               #   每个都存一份录像会让 对局录像/ 里出现 N 份同一局。
+                               "prefs": self.allow_prefs})
+        # 导出本局录像（回放包）。对局中途也能导：导的是"到此刻为止"的输入序列。
+        if path == "/api/replay":
+            fn = self.replay_ref
+            if fn is None:
+                return self._json({"ok": False, "err": "这一局不支持导出录像"})
+            try:
+                data = fn()
+            except Exception as e:      # noqa: BLE001
+                return self._json({"ok": False, "err": "导出失败：%s" % e})
+            if not data:
+                return self._json({"ok": False, "err": "这一局还没开始"})
+            return self._json({"ok": True, "data": data})
         self.send_error(404)
 
     # ---------- POST ----------
@@ -795,8 +1027,52 @@ class Handler(BaseHTTPRequestHandler):
                 self._session().update({"mode": "remote", "host": host, "port": port})
             return self._json({"ok": ok, "err": err})
 
+        # 【v0.76】回退到本回合开始。★ 只有这个是 POST（它会真的改变对局）；
+        #   /api/caps 与 /api/replay 是只读查询，在 do_GET 里。
+        #   真正的动作在引擎【等答案】那一刻发生（那边抛 UndoRequest、由服务端重建），
+        #   所以 ok=True 只代表"要求已记下"，前端要靠随后的 reset 消息确认。
+        if path == "/api/undo":
+            fn = self.undo_ref
+            if fn is None:
+                return self._json({"ok": False, "err": "这一局不支持回退"})
+            # 【v0.76】指定回合：{round: N} → 退到第 N 回合开始；不带 = 本回合。
+            at = body.get("round") if isinstance(body, dict) else None
+            try:
+                ok, err = fn(at)
+            except TypeError:
+                # 老的 undo_ref 只收 0 个参数 —— 别为了一个按钮把整个接口打崩
+                ok, err = fn()
+            return self._json({"ok": ok, "err": err})
+
+        # 【v0.76】把本局录像【直接存进项目的 对局录像/】，返回文件名。
+        #   ★ 为什么不做成浏览器下载：下载目录里堆一堆长名 json，想重放还得
+        #     自己拼相对路径（用户原话："还要自己输文件名，默认文件名又很长"）。
+        #     存进项目里之后，`python replay.py` 不带参数就放最新那份。
+        if path == "/api/replay-save":
+            fn = self.replay_ref
+            if fn is None:
+                return self._json({"ok": False, "err": "这一局不支持导出录像"})
+            try:
+                data = fn()
+            except Exception as e:      # noqa: BLE001
+                return self._json({"ok": False, "err": "导出失败：%s" % e})
+            if not data:
+                return self._json({"ok": False, "err": "这一局还没开始"})
+            try:
+                import replay as _replay
+                nm = _replay.save_to_library(data)
+            except Exception as e:      # noqa: BLE001
+                return self._json({"ok": False, "err": "写文件失败：%s" % e})
+            return self._json({"ok": True, "name": nm})
+
         if path == "/api/local":
-            # 【v0.59】试玩台的座位页不许「本机开一局」—— 那会在试玩台进程里另起
+            # 【v0.76】★ 网页版**已经没有这个入口了**（原来那个「本机开一局」按钮
+            #   连同人数/电脑/种子/可选规则一起删掉）—— 开本机局请用「多开试玩台」，
+            #   它能开 N 个真人座位，比这里强得多。
+            #   接口本身保留：test_webui 的 Test12 拿它当"起一局"的夹具，
+            #   删了整条用例就没法测「再来一局」了。玩家在界面上摸不到它。
+            #
+            # 【v0.59】试玩台的座位页仍然不许调它 —— 那一按会在试玩台进程里另起
             #   一个服务端，把其它座位晾在旧局里（见 Handler.no_local 的注释）。
             if self.no_local:
                 return self._json({
@@ -828,6 +1104,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/disconnect":
             self.bridge.disconnect()
             return self._json({"ok": True})
+
+        if path == "/api/prefs":
+            # 【v0.76】玩家选项：服务器友好 / 自动录像。
+            #   没连上时也会把值记在 Bridge 里，连上的那一刻自动补报 ——
+            #   所以"先勾好再连"和"连上再勾"两种顺序都对。
+            f = body.get("friendly")
+            r = body.get("record")
+            ok, err = self.bridge.send_prefs(
+                f if isinstance(f, bool) else False,
+                r if isinstance(r, bool) else False)
+            return self._json({"ok": ok, "err": err})
 
         if path == "/api/names":
             # 【v0.35】存名字 + 顺手报给服务端（如果已经连上）。

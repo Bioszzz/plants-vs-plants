@@ -209,3 +209,93 @@
   /* iOS 焦点放大：输入框小于 16px 会把整页缩放过去 */
   #codex-q { font-size: 16px; }
 }
+
+/* ---------- 【v0.76】编辑图鉴文案 ----------
+   ★ 这一段只有"能编辑"的图鉴才会有元素可套（玩家手里的包没有后端，
+     渲染时根本不会产出 .cx-edit* 这些节点），所以放在这里没有副作用。 */
+
+.cx-edit-bar {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* "改过"的小点 —— 一眼看出哪几株被自己动过 */
+.cx-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--gold);
+  display: inline-block;
+  flex: none;
+}
+
+.cx-edit {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.cx-edit-h {
+  font-size: 13px;
+  margin-bottom: 12px;
+  color: var(--text);
+}
+
+.cx-edit-tip {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.cx-edit-l {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+.cx-edit-l textarea {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  box-sizing: border-box;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.65;
+  resize: vertical;
+}
+
+.cx-edit-l textarea:focus {
+  outline: none;
+  border-color: var(--green-dim);
+}
+
+.cx-edit-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cx-edit-msg {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.cx-edit-msg.bad {
+  color: var(--danger);
+}
+
+/* 手机：按钮别挤成一团 */
+@media (max-width: 560px) {
+  .cx-edit { padding: 10px; }
+  .cx-edit-btns .btn { flex: 1 1 auto; }
+  .cx-edit-msg { flex-basis: 100%; }
+}
