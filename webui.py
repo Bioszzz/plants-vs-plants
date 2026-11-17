@@ -380,6 +380,9 @@ class Bus:
         self._listeners = []
         self._history = []          # msg / hello / end —— 战报类，全量回放（有上限）
         self._pending = None        # 当前待答或等待提示，覆盖式，只留最新一条
+        # 【v0.77】最新一帧结构化场面。覆盖式：刷新页面只要最后那一帧，
+        #   不像战报那样需要全量回放。
+        self._state = None
         self._conn = {"type": "conn", "connected": False, "text": ""}
 
     def subscribe(self):
@@ -388,6 +391,8 @@ class Bus:
             q.put(dict(self._conn))
             for ev in self._history:
                 q.put(ev)
+            if self._state is not None:
+                q.put(self._state)
             if self._pending is not None:
                 q.put(self._pending)
             self._listeners.append(q)
@@ -409,6 +414,9 @@ class Bus:
                     # 【v0.15】新连上一次 = 新的一局：把上一局的战报清掉。
                     #   否则"再来一局"开出来的新局，日志里会连着上一局的几百条。
                     self._history = []
+            elif t == "state":
+                # 覆盖式，不进历史：刷新页面只要最新那一帧
+                self._state = obj
             elif t in ("ask", "wait"):
                 self._pending = obj
             else:                               # msg / hello / end
@@ -453,12 +461,21 @@ class Mirror:
     # 每批都立刻重跑的话，一回合要跑十遍。
     COALESCE = 0.12
 
-    def __init__(self, bus):
+    def __init__(self, bus, on_broken=None):
         self.bus = bus
+        # 【v0.77】本地算崩时通知外面（Bridge 会关掉「服务器友好」、让服务端恢复发战报）。
+        #   ★ 这不是"防御性编程讨好用户"，是**这类失败必须能自愈**：
+        #     默认已改成友好模式，算不出来又没人兜底，玩家看到的就是一片空白。
+        self.on_broken = on_broken
         self._lock = threading.Lock()
         self.data = None        # 头部 + 累积的答案（None = 这一局还没开始）
         self.shown = 0          # 已经推给前端多少行战报
+        self._state = None      # 最后推过的那一帧场面（服务端不再发了，这里自己算）
         self.save_file = False  # 「自动录像」：要不要顺手落盘
+        # 【v0.77】要不要把本地算出来的东西推到前端。
+        #   ★ 只有「服务器友好」才推：不友好的时候服务端本来就发了战报和场面，
+        #     本地再推一遍就是重复（自动录像只勾了"存盘"，不需要推）。
+        self.push_events = True
         self._timer = None
 
     # ---------- 收 ----------
@@ -466,6 +483,7 @@ class Mirror:
         with self._lock:
             self.data = None
             self.shown = 0
+            self._state = None
             t, self._timer = self._timer, None
         if t is not None:
             t.cancel()
@@ -482,6 +500,19 @@ class Mirror:
             d["answers"] = []
             self.data = d
             self.shown = 0
+            self._state = None
+        # 【v0.77】开局那一帧：此时还没有任何答案，重放跑不出场面，
+        #   所以直接建一局取初始 state —— 否则「服务器友好」下前端开局是空白卡片。
+        if self.push_events:
+            try:
+                import replay as _replay
+                st = _replay.build(dict(d)).state_json()
+            except Exception:       # noqa: BLE001 —— 算不出来也不该拦着开局
+                st = None
+            if st:
+                with self._lock:
+                    self._state = st
+                self.bus.push({"type": "state", "state": st})
         self._schedule()
 
     def rows(self, add):
@@ -527,21 +558,46 @@ class Mirror:
         if t is not None:
             t.cancel()
         data = self._snapshot()
-        if not data or not data.get("answers"):
+        if not data:
             return
         try:
             import replay as _replay
             _g, lines = _replay.run_replay(data)
         except Exception as e:      # noqa: BLE001 —— 本地算炸了不能让页面卡死
+            # 【v0.77】算不出来 = 有 Bug（同一串输入，服务端算得出、本地算不出，
+            #   多半是引擎/数据不一致）。处理顺序：先说人话 → 立刻自愈 → 留证据。
             self.bus.push({"type": "msg",
-                           "text": "（本地重算战报出错：%s —— 把「服务器友好」取消勾选，"
-                                   "改由服务器直接发战报）" % e})
+                           "text": "（本地重算失败：%s\n"
+                                   "  这是个 Bug，不是你操作错。已经切回『服务器直接发战报』，"
+                                   "这一局照常继续。\n"
+                                   "  想帮上忙的话：点右上角「⭳ 录像」把这一局导出来，发给作者。）" % e})
+            self.push_events = False
+            if self.on_broken is not None:
+                try:
+                    self.on_broken(e)
+                except Exception:   # noqa: BLE001 —— 自愈动作本身失败也不许再炸
+                    pass
             return
         with self._lock:
             start = self.shown
             self.shown = len(lines)
+        if not self.push_events:
+            # 只存盘、不推：服务端会自己发战报和场面，别重复
+            if self.save_file:
+                self._save(running=True)
+            return
         for t2 in lines[start:]:
             self.bus.push({"type": "msg", "text": str(t2)})
+        # 【v0.77】场面也由本地算：服务端在「服务器友好」下连 state 都不发。
+        #   ★ 只推最后一帧 —— 前端画卡片只需要"现在什么样"。
+        frames = getattr(_g, "replay_states", None)
+        if frames:
+            last = frames[-1]
+            with self._lock:
+                changed = self._state is not last
+                self._state = last
+            if changed:
+                self.bus.push({"type": "state", "state": last})
         if self.save_file:
             self._save(running=True)
 
@@ -589,7 +645,8 @@ class Bridge:
         # 【v0.76】玩家选项（浏览器那边勾的，连接后随时可改）。
         #   friendly = 服务器友好（自己算战报）；record = 自动录像（另存一份）。
         self.prefs = {"friendly": False, "record": False}
-        self.mirror = Mirror(bus)
+        self.mirror = Mirror(bus, on_broken=self._mirror_broken)
+        self._mirror_broken_once = False
 
     # ---------- 状态 ----------
     def status(self):
@@ -728,6 +785,17 @@ class Bridge:
             return False, "发送失败：%s" % e
         return True, None
 
+    def _mirror_broken(self, err):
+        """【v0.77】本地算崩 → 自愈：关掉「服务器友好」，让服务端恢复发战报。
+
+        ★ 只降一次：反复发 prefs 没有意义，而且会把界面刷满。
+        """
+        if self._mirror_broken_once:
+            return
+        self._mirror_broken_once = True
+        self.mirror.push_events = False
+        self.send_prefs(False, self.prefs["record"])
+
     def send_prefs(self, friendly, record):
         """【v0.76】把玩家选项报给服务端。中途改也生效（下一批答案起按新设置走）。
 
@@ -735,8 +803,14 @@ class Bridge:
           这样"先勾好再连接"和"连上再勾"两种顺序都对。
         """
         friendly, record = bool(friendly), bool(record)
+        # 这条连接上已经因为"本地算不出来"降过级 → 不再接受重新打开
+        #   （否则前端一刷新就又打开，界面接着空白）
+        if self._mirror_broken_once:
+            friendly = False
         self.prefs["friendly"], self.prefs["record"] = friendly, record
         self.mirror.save_file = record
+        # 友好 = 服务端只发答案，战报和场面都靠本地算 → 本地算完要推
+        self.mirror.push_events = friendly
         with self._lock:
             sock = self._sock
         if sock is None:

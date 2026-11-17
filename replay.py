@@ -116,16 +116,26 @@ class ReplayController(Controller):
       （通常是规则改过），继续跑下去只会得到一局"看着像、其实不对"的战报。
     """
 
-    def __init__(self, who, rows, players):
+    def __init__(self, who, rows, players, state_sink=None):
         self.who = who
         self.rows = rows
         self.players = players
         self.i = 0
         self._ans = PENDING
         self.consumed = 0
+        # 【v0.77】把"场面"也收集起来：客户端要拿它画卡片。
+        #   ★ 只挂在 1 号控制器上（每个控制器都会收到同一份 state，全挂就重复 N 份）。
+        self.state_sink = state_sink
+        # 引擎据此决定"要不要为这个控制器算一份 state"（见 Game.say_state）
+        self.wants_state = state_sink is not None
 
     def notify(self, text):
         pass
+
+    def notify_state(self, text, state):
+        # 文本由 game 的 output 收集，这里只留结构化场面
+        if self.state_sink is not None:
+            self.state_sink.append(state)
 
     def dispatch(self, q):
         if self.i >= len(self.rows):
@@ -193,7 +203,10 @@ def build(data, output=None, extra_delay=0.0):
             % (seed,))
     rng = random.Random(seed)
 
-    ctrls = [ReplayController(i + 1, by_who.get(i + 1, []), None)
+    # 【v0.77】第一个控制器顺手收集"每一刻的场面"，挂在 game.replay_states 上
+    states = []
+    ctrls = [ReplayController(i + 1, by_who.get(i + 1, []), None,
+                              state_sink=states if i == 0 else None)
              for i in range(n)]
     # 牌库：录像里记的是"当时能出哪几株"。当前版本里没有的名字要剔掉
     #   （例如测试专用植物只在测试进程里存在）—— 否则 _q_plant 会 KeyError。
@@ -210,6 +223,9 @@ def build(data, output=None, extra_delay=0.0):
     for c in ctrls:
         c.players = g.players
         c.rows = by_who.get(c.who, [])
+    # 【v0.77】这一局跑出来的"每一刻场面"。客户端（webui.Mirror）拿最后一帧画卡片，
+    #   于是「服务器友好」模式下服务端连 state 都不用发。
+    g.replay_states = states
     return g
 
 

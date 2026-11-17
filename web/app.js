@@ -336,16 +336,22 @@ $('btn-connect').onclick = () => {
    ★ 缓存在 localStorage：换局、重开页面都记得住（这是"我这个人"的偏好）。 */
 const PREFS_KEY = 'pvp.prefs.v1';
 
+/* 【v0.77】「服务器友好」默认恒开、前端不给开关（防呆）：
+     服务端只发操作，战报和场面都由本地算 —— 一局 20KB 降到 2~5KB。
+   要临时关掉排查，地址后面加 ?friendly=0（作者用的后门）。
+   ★ 本地算崩时会自动降级回"服务器发战报"，并提示玩家导出录像报 bug。 */
+const FRIENDLY_ON = !/[?&]friendly=0(&|$)/.test(location.search);
+
 function readPrefs() {
   let v = {};
   try { v = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') || {}; } catch (e) {}
-  return { record: !!v.record, friendly: !!v.friendly };
+  return { record: !!v.record, friendly: FRIENDLY_ON };
 }
 
 function pushPrefs() {
-  const r = $('p-record'), f = $('p-friendly');
-  const p = { record: !!(r && r.checked), friendly: !!(f && f.checked) };
-  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch (e) {}
+  const r = $('p-record');
+  const p = { record: !!(r && r.checked), friendly: FRIENDLY_ON };
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ record: p.record })); } catch (e) {}
   fetch('/api/prefs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -355,10 +361,9 @@ function pushPrefs() {
 
 (function initPrefs() {
   const p = readPrefs();
-  const r = $('p-record'), f = $('p-friendly');
+  const r = $('p-record');
   if (r) { r.checked = p.record; r.onchange = pushPrefs; }
-  if (f) { f.checked = p.friendly; f.onchange = pushPrefs; }
-  if (p.record || p.friendly) pushPrefs();     // 后端可能刚重启，补报一次
+  pushPrefs();       // 后端可能刚重启，补报一次（friendly 默认开，必须让它知道）
 })();
 
 

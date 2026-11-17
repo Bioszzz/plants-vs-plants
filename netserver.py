@@ -187,7 +187,10 @@ class RemoteController(Controller):
         本来也重新算出了同一份场面（战报文本由它自己出）。
         """
         if self.friendly:
-            self._send({"type": "state", "state": state})
+            # 【v0.77】连 state 也不发了 —— 客户端用本地影子引擎自己算出来
+            #   （webui.Mirror 把场面推给前端）。服务端一局只剩 rep_rows 那 2~5 KB。
+            #   ★ 代价：客户端要么跑得动引擎，要么界面就没有卡片。所以这条只
+            #     在"确定对方是新版网页客户端"时才有意义（默认开启靠这个前提）。
             return
         self._send({"type": "msg", "text": text, "state": state})
 

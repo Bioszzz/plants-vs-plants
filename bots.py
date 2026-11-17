@@ -6,9 +6,8 @@ bots.py —— 极简电脑对手（热座版 main.py 与联机服务端 netserv
 继承 SyncController：引擎下发问题后，电脑在 poll() 时瞬间算好答案，
 不占用"同时问"的等待时间。
 """
-import random
-
 from engine import SyncController
+from plants_data import PLANTS
 
 
 class BotController(SyncController):
@@ -17,13 +16,30 @@ class BotController(SyncController):
         pass  # 电脑保持安静；想看引擎发给它的所有广播，把这行改成 print(text)
 
     def choose_plant(self, game, player):
-        if player.seeds >= 5:
-            return "杨桃"
-        if player.seeds >= 2 and random.random() < 0.35:
-            return "白菜"
-        if random.random() < 0.35:
-            return "木盾"
-        return "种子"
+        """【v0.77】随机出一株"现在出得起"的植物。
+
+        ★ 以前是写死的梯子：种子 ≥5 一律出杨桃，否则 35% 白菜 / 35% 木盾 / 种子。
+          于是只要攒到 5 颗种，电脑就【每回合都是杨桃】——随机只发生在穷的时候。
+          用户 2026-11-17："我记得曾经有个时间段是随机出的"，就是要回到那个手感。
+        ★ 判据必须与引擎【一致】，不要在这里另写一遍公式：
+          · 代价走 game.cost_of()（它包含倍耗 / 鱼腥味那层加成）
+          · 耗命看 hp - cost_hp <= 0 → 会把自己耗死的不出
+        ★ 用 game.rng（不是全局 random）：一局的随机数由 rng_seed 决定，
+          录像重放/回退才能跑出同一局。
+        """
+        ok = []
+        for name in game.playable:
+            spec = PLANTS.get(name)
+            if spec is None:
+                continue
+            if player.seeds < game.cost_of(spec, player):
+                continue
+            if spec.cost_hp > 0 and player.hp - spec.cost_hp <= 0:
+                continue
+            ok.append(name)
+        if not ok:
+            return "种子"          # 连种子都不在牌库里时的兜底（正常不会发生）
+        return game.rng.choice(ok)
 
     def choose_release(self, game, player):
         # 【v0.7】不释放 = 本回合属性全归零、出牌时付的种子还不退，

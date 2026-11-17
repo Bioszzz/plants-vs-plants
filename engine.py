@@ -1074,6 +1074,14 @@ class Game:
         text = self.state_text()
         if self._output is not None:
             self._output(text)
+            # 【v0.77】热座 / 重放也有"想要结构化场面"的控制器（重放要给客户端画卡片）。
+            #   ★ 默认没人认领，所以原有行为一字不变；有人认领才算一次 state_json()。
+            warm = [c for c in self.controllers
+                    if getattr(c, "wants_state", False)]
+            if warm:
+                st = self.state_json()
+                for c in warm:
+                    c.notify_state(text, st)
             return
         state = self.state_json()
         for c in self.controllers:

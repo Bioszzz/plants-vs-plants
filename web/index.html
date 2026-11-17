@@ -138,10 +138,8 @@
         <input type="checkbox" id="p-record">
         <span><b>自动录像</b> —— 把这一局另存一份到我的 <code>对局录像/</code>，随时能重放</span>
       </label>
-      <label>
-        <input type="checkbox" id="p-friendly">
-        <span><b>服务器友好</b> —— 服务器只发操作不发战报，战报在我本地算（帮房主省带宽）</span>
-      </label>
+      <!-- 【v0.77】「服务器友好」不再给开关：默认恒开（服务器只发操作，战报和场面本地算）。
+           要临时关掉做排查，地址后面加 ?friendly=0。 -->
     </div>
 
     <p class="tip">
