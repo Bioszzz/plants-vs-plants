@@ -962,6 +962,7 @@ class Game:
         # 【v0.37】静默缓冲：None = 正常播报；list = 播报先攒进这里（见 say）。
         #   用途 = 杨桃类连击的日志压缩（把 N 发合并成一行）。
         self._quiet = None
+        self._quiet_stack = []      # 声明期"批"的嵌套：每批存旧的 _quiet
         # 【v0.28】存活环：一圈还活着的玩家，生命归 0 当场摘人（见 Ring）。
         #   建在这里（发牌之后、任何阶段之前）：环的初始成员就是全体玩家。
         self.ring = Ring(self.players)
@@ -989,12 +990,15 @@ class Game:
         #   friend_assist_plans —— 番茄的【最终目标】（+9 在【辅助防】落地）
         #   cut_exempt_plans —— 刀叶"切一半"时选的人（【附加层】施加时跳过他们）
         self.revive_mode_plans = {}
+        # 【2026-11-20】161 在【声明期】答的原文 {mode, target}；结算期只兑现它
+        self.revive_ans = {}
         self.water_hp_plans = {}
         self.water_def_plans = {}
         self.friend_assist_plans = {}
         self.cut_exempt_plans = {}
         # 【v0.71】见 PLAN_TABLES 里的 cond_plans（勾取者的条件方案）
         self.cond_plans = {}
+        self.cond_abs_charge = {}   # 【2026-11-20】聚电支配者的条件充能
         self.absorb_target_plans = {}
         # 【v0.71】_distribute_absorbed 的播报去重（同回合可能被调两次：
         #   原主人声明后一次、勾取兑现后覆盖再一次，不该把"随机分配"念两遍）
@@ -1649,16 +1653,13 @@ class Game:
                     "（这一株已归 %s 支配 → 队友挂它名下）" % _who.tag))
 
     def _revive_phase(self):
-        """【场末 3 复活】161 生命之花的"复活"这一半。
+        """【场末 3 复活】161 生命之花的"复活"这一半 —— 只兑现，**不问**。
 
-        ★★【拆分】用户 2026-10-25："一个植物的结算明明可以拆成多个，没有必要
-          复活/加血放在一起，牛角菱不就拆了吗？猫尾草的超防和攻击不也拆了吗？"
-          → 复活是【复活】这一步，加血并进【加血】那一步（跟所有加血一起）。
-          二选一仍然只问一次（在【复活】这一步问），选"加血"就打个标记，
-          轮到【加血】那一步再落地 —— 同一株只会走其中一条路。
-        ★ 为什么复活排在加血之前：它救的是"上一回合及更早"死的人，和本回合
-          的伤害没有冲突；放最前面，被救的人还能赶在环相关机制之前回到圈上。
-        ★ 没有可救的人就【不问】，直接标记成"加血"（省一道空题，战报说明原因）。
+        ★★ 题已经在【批 3】（水滴 · 队友连接 · 复活 · 聚电）问过了。
+          留在这问等于让它等毁灭 / 消除落地之后才表态，全盘就它一个人看得到那些结果。
+          答案存在 revive_ans（勾取兑现时被 cond_plans["revive"] 盖掉）。
+        ★ 二选一仍然只走一条路：选了"复活"就跳过【加血】那一步。
+        ★ 没有可救的人时，声明期已经直接记成"加血"，这里不吭声。
         """
         holders = [p for p in self.players
                    if p.alive and p in self.released
@@ -1667,28 +1668,8 @@ class Game:
         if not holders:
             return
         self.say("—— 复活（161 生命之花；与加血二选一）——")
-        ask = []          # (植物主人, 候选, 真正答题的人)
         for p in holders:
-            cands = self._revivable(p)
-            if cands:
-                # ★【v0.72】被[勾取]的这一株，"救谁"该问勾取者 ——
-                #   `_hook_pass("revive")` 已经先跑过，此刻 hooked_by 是确定的。
-                _hk = getattr(p.field, "hooked_by", None)
-                ask.append((p, cands, _hk if _hk is not None else p))
-            else:
-                self.say("  · %s 的【%s】：没有可复活的人（本回合刚死的不算）"
-                         "→ 只能选加血"
-                         % (p.tag, p.field.spec.name))
-                self.revive_mode_plans[p] = "heal"
-        # ★★ 必须用 gather_by_batches：两株生命之花可能同时被同一个人支配
-        #   （勾取者一人答两份），而 gather() 一批里一个答题人只能有一道题 ——
-        #   否则 SyncController 会 poll 到空、直接 RuntimeError。
-        _pos = {pp: i for i, (pp, _c, _a) in enumerate(ask)}
-        ans = self.gather_by_batches(
-            [self._q_revive(p, c, by=(a if a is not p else None))
-             for p, c, a in ask]) if ask else {}
-        for p in holders:
-            v = ans.get(_pos.get(p)) or {}
+            v = self.revive_ans.get(p) or {}
             if v.get("mode") != "revive" or v.get("target") is None:
                 self.revive_mode_plans[p] = "heal"
                 continue
@@ -1698,8 +1679,8 @@ class Game:
                     tgt = c
                     break
             if tgt is None:
-                # validate 已经挡过非法编号，走到这里只能是"同一个死人被两个
-                #   生命之花同时选中、前面那个已经把他救活了" —— 退回加血。
+                # validate 已经挡过非法编号，走到这里只能是"同一个人被两株看中、
+                #   前面那株已经把他救活了" —— 退回加血。
                 self.revive_mode_plans[p] = "heal"
                 self.say("  · %s 的【%s】想救的人已经被别人救活 → 改为加血"
                          "（在【加血】那一步落地）"
@@ -2097,6 +2078,8 @@ class Game:
         "flash_plans",    # 电系：闪击
         "friend_plans",   # 队友连接（107 番茄）
         "revive_mode_plans",  # 161 的二选一结果：revive / heal
+        # 【2026-11-20】161 在【声明期】答的原文 {mode, target}；结算期只认它
+        "revive_ans",
         "water_hp_plans",     # 水滴抵命（声明）：player -> True
         "water_def_plans",    # 水滴加固（声明）：player -> 花几个
         "friend_assist_plans",  # 番茄的最终目标（+9 辅助防在【辅助防】落地）
@@ -2112,6 +2095,8 @@ class Game:
         #   (回答者编号, id(被收那株)) -> ([目标...], 播报文字)
         #   ★ 每个可能收到它的人各存一份；结算时【谁真收到】用谁那份
         "absorb_target_plans",
+        # 【2026-11-20】聚电支配者的"如果收到就充几颗"：(回答者编号, id(那株)) -> 颗数
+        "cond_abs_charge",
     )
 
     def _reset_round_plans(self):
@@ -2194,230 +2179,322 @@ class Game:
                 % (len(ghosts), "、".join(ghosts)))
 
     def phase_bluff(self):
-        """博弈阶段：公示场面后分三步，每一步都是【同时问、收满为止】：
-           ① 释放决定 → ② 充能（仅释放了充能植物的人）→ ③ 指定目标（仅攻击植物）
-        【已确认】充能在"决定释放之后、指定目标之前/之后"皆可，样品取目标之前。
-        【v0.11】单挑（存活 2 人）时 ③ 整步跳过：目标自动锁定（只有一个对手）；
-        ② 充能与 ①b/①c 的水滴照旧要问 —— 它们涉及"花多少"的取舍，不该用默认值。
-        ★【v0.73】① 释放决定【不再跟单挑挂钩】：改看房间规则「战斗！爽」
-          （开 = 全员默认释放、不问；关 = 照常逐个问，1v1 也问）。"""
-        self.say("—— 博弈阶段 ——")
-        self.say_state()
-        self._reset_round_plans()
-        # ★ knife_played【不能清】：规则 15.8 是"本局累计出过三次"。
-        self.released = set()
-        # 【v0.11】单挑模式：存活 2 人 → ③ 目标自动锁定（充能/水滴照旧要选）
-        duel = self.duel_auto and self.is_duel()
-        # ★【v0.73】"战斗！爽"：全员默认释放。它取代了原来"单挑自动释放"的硬编码 ——
-        #   用户 2026-10-27："现在'单挑默认释放植物'这一条取消掉，
-        #   改成检测是否开启这一条规则"。
-        battle = bool(self.rules.get("battle_fun", DEFAULT_RULES["battle_fun"]))
+        """【v0.77】「骗子们」薄壳：开着时把整个博弈阶段的播报全延后，
+        收齐之后一次性放出；关着时直接走 _bluff_body（老路径，一字不改）。
 
-        # ① 释放决定【v0.7】：场上植物的玩家【全部】同时决定释放与否
-        #    —— 不问才奇怪：问不问本身就是信息，只问有主动效果的等于泄露了谁带了攻击牌。
-        #    —— 例外一：被显式声明 must_release 的植物，不询问、出牌即自动释放。
-        #    —— 例外二【v0.73】：房间规则「战斗！爽」开着时【全员不询问】，
-        #       一律按释放处理（原来这一条挂在"单挑"上，已按用户要求摘掉）。
-        #    —— 释放 = 维持原效果；不释放 = 本回合所有属性归零，且已付的种子不退。
+        ★★ "同时问、同时发"的实质是【玩家之间互不可见】，不是"一道题里
+          塞十个小问"。提问本来只有本人看得到，所以把播报压到最后，
+          欺骗性就成立了 —— 而落地逻辑（plans / 充能 / 勾取 / 刀叶…）
+          一行都不用改，不存在两份实现。
+        ★ 复用 `_quiet`（v0.37 给杨桃日志压缩做的缓冲）：存旧值、清空、跑完再放。
+        ★★ 开场（"博弈阶段"标题 + 当前场面）**不压**：玩家要看着场面才能决定
+          释放 / 目标，压后等于让人摸黑下注；而且 `say_state()` 是绕过 `say`
+          直发结构化数据的，压它会打乱顺序（实测量过：场面会跑到标题前面）。
+          被压住的只有"声明"那部分 —— 那才是要藏的东西。
+        """
+        liars = bool(self.rules.get("liars", DEFAULT_RULES["liars"]))
+        # —— 开场：标题 + 场面，两条路径共用，且都实时发 ——
+        self.say("—— 博弈阶段 ——")
+        if liars:
+            self.say("—— 骗子们：所有表态同时收齐，最后一次性公示"
+                     "（期间看不到别人的声明）——")
+        self.say_state()
+
+        if not liars:
+            return self._bluff_body()
+        keep = self._quiet
+        self._quiet = []
+        try:
+            self._bluff_body()
+        finally:
+            buf = self._quiet or []
+            self._quiet = keep
+        for line in buf:
+            self.say(line)
+
+    # ══════════════════════════════════════════════════════════════════
+    # 声明期（博弈阶段）—— 按《声明顺序（现有）》分 7 批
+    #
+    # ★★ 批 = 【播报边界】，不是"一次 gather"：同一批里一个人可能有好几道题
+    #    （gather() 的答案按人存，一批里一人只能一道），本来就得分几轮收。
+    #    所以每批的题是【分几次 gather 收、但一句都不播】，收齐后统一放出来
+    #    —— 对玩家来说与"同时下发"完全一样（谁也没看见别人的答案）。
+    # ★ 标题在【提问时】播（_batch_start），不在公告时补：否则会出现
+    #    "标题写着目标声明、内容里先冒出刀叶"。
+    # ══════════════════════════════════════════════════════════════════
+    def _batch_start(self, title):
+        """开一批：记下标题；这一批的播报全部攒着，等 _batch_end 一起放。"""
+        self._quiet_stack.append((self._quiet, title))
+        self._quiet = []
+
+    def _batch_end(self):
+        """收一批：标题 + 全部公告，按顺序一起放出去。
+
+        ★ 标题在这里播而不是 _batch_start：这一批一句话都没有时不留下空标题。
+          要的效果是"这一批的答案开头就是它的标题、中间不夹别的批"。
+        """
+        prev, title = self._quiet_stack.pop()
+        buf = self._quiet or []
+        self._quiet = prev
+        if not buf:
+            return
+        self.say(title)
+        for line in buf:
+            self.say(line)
+
+    def _bluff_body(self):
+        """博弈阶段的 7 批 —— 顺序见《声明顺序（现有）》，别在这里另定一套。
+
+        ★ 每批一个方法，方法名就是批名；改顺序只动这七行。
+        """
+        self._reset_round_plans()
+        self.released = set()
+        # ★ knife_played【不能清】：规则 15.8 是"本局累计出过三次"。
+        battle = bool(self.rules.get("battle_fun", DEFAULT_RULES["battle_fun"]))
+        # ★★ 整段包 try/finally：批里的 gather 可能抛异常（最典型是玩家按了
+        #   【回退】→ UndoRequest），一旦带着"缓冲还没放"的栈退出去，_quiet
+        #   就永远停在"攒着不发"，后面所有战报静默消失 —— 看起来就是"卡死"。
+        try:
+            self._declare_release(battle)  # 批 1  释放
+            self._declare_hook()           # 批 2  勾取
+            self._declare_misc()           # 批 3  水滴 · 队友连接 · 复活 · 聚电
+            self._declare_charge()         # 批 4  充能
+            self._declare_targets()        # 批 5  噬魂 · 有收益批 · 普通攻击
+            self._declare_splash_cat()     # 批 6  溅射 · 猫尾草
+            self._declare_flash()          # 批 7  [闪电一击]
+            self._declare_cut()            # 批 8  消除 / 废除（永远是最后一批）
+        finally:
+            while self._quiet_stack:
+                self._batch_end()
+
+    # ---------- 批 1 · 释放 ----------
+    def _declare_release(self, battle):
+        """场上植物的玩家【全部】同时决定释放与否。
+
+        例外一：must_release 的植物，不询问、出牌即自动释放。
+        例外二：[不灭] —— 原稿"使用者自己也不能决定释放与否"。
+        例外三：房间规则「战斗！爽」开着时全员不问，一律按释放。
+        例外四：场上有【猪笼草】（队友门）时，番茄既不问释放、也不能选空目标。
+        """
+        self._batch_start("—— 释放决定 ——")
         onfield = [p for p in self.players
                    if p.alive and p.field.spec is not EMPTY]
-
         if battle:
-            # 「战斗！爽」：没有"不释放"这个选项了（它本来是多人谈判里的诚意信号）
             self.say("—— 战斗！爽：所有植物默认释放，略过释放确认 ——")
             for p in onfield:
                 self.released.add(p)
                 self._apply_release(p)
-        else:
-            # 【v0.38】forced 名单里现在有【两类】"不给不释放选项"的植物：
-            #   · must_release —— 出牌即自动释放（主要是为了不泄露牌型）；
-            #   · immortal（[不灭]）—— 原稿词条："使用者自己也不能决定释放与否"。
-            #     两者战报关切口径不同，所以分开写；都走 _apply_release。
-            # 【v0.45】第三类"不给不释放选项"：场上有【队友门】（22 猪笼草，
-            #   link_gate）在场时，107 番茄（link_friend）也必须释放 ——
-            #   用户原话："此时，番茄既不能不释放，也不能选取空目标"。
-            #   理由：门在场就是为了接管一切"增加队友连接"，番茄若靠
-            #   "不释放"躲开，等于绕过这道门。
-            #   ⚠️ 这里判的是"猪笼草【在场上】"（本回合出牌出来了），不是
-            #      "它已生效" —— 因为此刻它自己释放与否还在同一批里问（先有鸡）。
-            #      真正能不能当门用，看结算期（_live_gates），见 _friend_resolve_phase。
-            gates_onfield = [p for p in onfield
-                             if getattr(p.field.spec, "link_gate", False)]
-            gate_bound = ([p for p in onfield if p.field.spec.link_friend]
-                          if gates_onfield else [])
-
-            for p in onfield:
-                spec = p.field.spec
-                if spec.must_release or is_immortal(spec):
-                    self.released.add(p)
-                    if is_immortal(spec):
-                        p.field.forced_release = True
-                        self.say("%s 的【%s】自动释放（【不灭】—— 使用者自己也不能"
-                                 "决定不释放）" % (p.tag, spec.name))
-                    else:
-                        self.say("%s 的【%s】自动释放（该植物必须释放，"
-                                 "不给不释放的选项）" % (p.tag, spec.name))
-                    self._apply_release(p)
-                elif p in gate_bound:
-                    self.released.add(p)
+            return self._batch_end()
+        gates_onfield = [p for p in onfield
+                         if getattr(p.field.spec, "link_gate", False)]
+        gate_bound = ([p for p in onfield if p.field.spec.link_friend]
+                      if gates_onfield else [])
+        for p in onfield:
+            spec = p.field.spec
+            if spec.must_release or is_immortal(spec):
+                self.released.add(p)
+                if is_immortal(spec):
                     p.field.forced_release = True
-                    self.say("%s 的【%s】自动释放（场上存在【猪笼草】队友门 —— "
-                             "番茄不能不释放）" % (p.tag, spec.name))
+                    self.say("%s 的【%s】自动释放（【不灭】—— 使用者自己也不能"
+                             "决定不释放）" % (p.tag, spec.name))
+                else:
+                    self.say("%s 的【%s】自动释放（该植物必须释放，"
+                             "不给不释放的选项）" % (p.tag, spec.name))
+                self._apply_release(p)
+            elif p in gate_bound:
+                self.released.add(p)
+                p.field.forced_release = True
+                self.say("%s 的【%s】自动释放（场上存在【猪笼草】队友门 —— "
+                         "番茄不能不释放）" % (p.tag, spec.name))
+                self._apply_release(p)
+        need = [p for p in onfield
+                if not (p.field.spec.must_release or is_immortal(p.field.spec))
+                and p not in gate_bound]
+        if need:
+            ans = self.gather([self._q_release(p) for p in need])
+            for p in need:
+                if ans[p.idx]:
+                    self.released.add(p)
                     self._apply_release(p)
+                else:
+                    p.field.stand_down()
+                    self.say("%s 不释放【%s】→ 本回合所有属性归零、没有任何效果"
+                             "（防御0、免疫失效、不产种子；出牌时付的种子也不退）"
+                             % (p.tag, p.field.spec.name))
+        self._batch_end()
 
-            need = [p for p in onfield
-                    if not (p.field.spec.must_release or is_immortal(p.field.spec))
-                    and p not in gate_bound]
+    # ---------- 批 2 · 勾取 ----------
+    def _declare_hook(self):
+        """103 牛角菱 —— 单独一批：它决定后面这些题【由谁答】。
 
-            if need:
-                ans = self.gather([self._q_release(p) for p in need])
-                for p in need:
-                    if ans[p.idx]:
-                        self.released.add(p)
-                        self._apply_release(p)
-                    else:
-                        p.field.stand_down()
-                        self.say("%s 不释放【%s】→ 本回合所有属性归零、没有任何效果"
-                                 "（防御0、免疫失效、不产种子；出牌时付的种子也不退）"
-                                 % (p.tag, p.field.spec.name))
+        被勾那株的充能 / 目标 / 刀 / 左右分配 / 链，全改由勾取者答；
+        答题人还没定，题就没法下发，所以它必须是所有"属于植物"的题的祖先。
+        """
+        hooks = [p for p in self.players
+                 if p.alive and p in self.released and p.field is not None
+                 and p.field.spec.hook_same]
+        if not hooks:
+            return
+        self._batch_start("—— 勾取 ——")
+        for p in hooks:
+            self._hook_declare(p)       # 每株一次 gather，但播报攒到批末
+        self._batch_end()
 
-        # ①b【v0.10】水滴：出喷菇的人可以选择"用 1 个水滴抵掉半条命代价"
-        #     ★【2026-10-25】这里【只声明】：真正退血与扣水滴在【加血】那一步
-        #       （效果要看结算顺序；声明期只记意图）。
-        water_hp = [p for p in self.players
-                    if p.alive and p in self.released and p.water > 0
-                    and p.field.spec.cost_hp > 0
-                    and p.field.spec.name in WATER_FUELS]
-        if water_hp:
+    # ---------- 批 3 · 水滴 · 队友连接 · 复活 · 聚电 ----------
+    def _declare_misc(self):
+        """同层四道题：水滴 / 队友连接 / 复活 / 聚电 —— 互不看结果。
+
+        四道题都可能因为【勾取】改由勾取者答，所以整批排在批 2 之后。
+        """
+        water = [p for p in self.players
+                 if p.alive and p in self.released and self._water_budget(p) > 0]
+        friend_qs, friend_ctx = self._friend_questions()
+        revivers = [p for p in self.players
+                    if p.alive and p in self.released and p.field is not None
+                    and getattr(p.field.spec, "revive_one", False)]
+        absorbers = [p for p in self.players
+                     if p.alive and p in self.released and p.field is not None
+                     and p.field.spec.absorb_targets
+                     and not p.field.spec.hook_same]
+        if not (water or friend_ctx or revivers or absorbers):
+            return
+        self._batch_start("—— 水滴 · 队友连接 · 复活 · 聚电 ——")
+        self._declare_water(water)
+        if friend_ctx:
+            ans = self.gather(friend_qs) if friend_qs else {}
+            self._friend_apply_answers(ans, friend_ctx)
+            self._friend_cond_questions(friend_ctx)
+        self._declare_revive(revivers)
+        self._absorb_declare_all()
+        self._batch_end()
+
+    def _water_budget(self, p):
+        """本回合能花的【水】的上限 = 手上 + 本回合即将产出的那 +1（水滴草）。
+
+        产水滴与花水滴都在【辅助防】同一步，先产出、后花费，所以这 1 滴当回合花得掉。
+        """
+        gain = p.field.spec.water_gain if (p in self.released and p.field) else 0
+        return p.water + gain
+
+    def _declare_water(self, water):
+        """水滴：抵命 + 加固。两问同一批，花的是同一笔水。
+
+        ★★ 加固的预算必须【扣掉抵命那 1 个】—— 否则声明"抵命 1 + 加固全部"
+          会在结算时被 min(n, 手上水) 静默截断（旧版就是这么错的）。
+        """
+        hp_list = [p for p in water
+                   if p.field.spec.cost_hp > 0
+                   and p.field.spec.name in WATER_FUELS]
+        if hp_list:
             self.say("—— 水滴：抵命（声明）——")
-            ans = self.gather([self._q_water_hp(p) for p in water_hp])
-            for p in water_hp:
+            ans = self.gather([self._q_water_hp(p) for p in hp_list])
+            for p in hp_list:
                 if ans[p.idx]:
                     self.water_hp_plans[p] = True
                     self.say("%s 声明：用 1 个水滴抵掉【%s】的半条命代价"
                              "（退血在【加血】那一步落地）"
                              % (p.tag, p.field.spec.name))
+        budgets = {}
+        for p in water:
+            b = self._water_budget(p)
+            if self.water_hp_plans.get(p):
+                b = max(0, b - 1)          # 抵命已经占掉 1 个
+            budgets[p] = b
+        todo = [p for p in water if budgets[p] > 0]
+        if not todo:
+            return
+        self.say("—— 水滴：加固（声明）——")
+        ans = self.gather([self._q_water_def(p, budgets[p]) for p in todo])
+        for p in todo:
+            n = ans[p.idx]
+            if not n or n <= 0:
+                continue
+            n = min(int(n), budgets[p])
+            self.water_def_plans[p] = n
+            self.say("%s 声明：花 %d 个水滴加固（真扣与加防在【辅助防】那一步落地）"
+                     % (p.tag, n))
 
-        # ①c【v0.10】水滴：花 x 个水滴 → 本回合防御 +x（1:1，你自己定的比例）
-        #     ★【2026-10-25】同样只声明。而且预算里【算上本回合刚产的水】：
-        #       水滴草的 +1 在【辅助防】那一步产出，同一步里先产出、后花费 ——
-        #       这才叫"本回合即可使用"（旧版是拿这句当理由把产水滴留在声明期，
-        #       用户 2026-10-25 指出那条理由是错的）。
-        def _water_budget(q):
-            extra = q.field.spec.water_gain if q in self.released else 0
-            return q.water + extra
+    def _declare_revive(self, holders):
+        """161 生命之花：救谁 / 转加血 —— 在声明期问，结算期只兑现。
 
-        water_def = [p for p in self.players
-                     if p.alive and p in self.released and _water_budget(p) > 0]
-        if water_def:
-            self.say("—— 水滴：加固（声明）——")
-            ans = self.gather([self._q_water_def(p, _water_budget(p))
-                               for p in water_def])
-            for p in water_def:
-                n = ans[p.idx]
-                if not n or n <= 0:
-                    continue
-                self.water_def_plans[p] = int(n)
-                self.say("%s 声明：花 %d 个水滴加固（真扣与加防在【辅助防】那一步落地）"
-                         % (p.tag, int(n)))
+        ★ 挪出来的理由：留在结算期问，等于让它在毁灭 / 消除落地之后才表态，
+          全盘就它一个人看得到那些结果。
+        """
+        if not holders:
+            return
+        hook_act = self._hook_act_map()
+        for p in holders:
+            cands = self._revivable(p)
+            if not cands:
+                self.revive_mode_plans[p] = "heal"
+                self.say("  · %s 的【%s】：没有可复活的人（本回合刚死的不算）"
+                         "→ 只能选加血" % (p.tag, p.field.spec.name))
+                continue
+            ans = self.gather([self._q_revive(p, cands)])
+            self.revive_ans[p] = ans.get(p.idx)
+            v = self.revive_ans[p] or {}
+            tgt = next((c for c in cands if c.idx == v.get("target")), None)
+            if v.get("mode") == "revive" and tgt is not None:
+                self.say("%s 声明：【%s】选择复活 %s（在【复活】那一步落地）"
+                         % (p.tag, p.field.spec.name, tgt.tag))
+            else:
+                self.say("%s 声明：【%s】这回合选加血（在【加血】那一步落地）"
+                         % (p.tag, p.field.spec.name))
+            hk = hook_act.get(p)
+            if hk is None:
+                continue
+            a2 = self.gather([self._q_revive(p, cands, by=hk, cond=True)])
+            c = a2.get(hk.idx) or {}
+            self.cond_plans.setdefault((hk.idx, p.idx), {})["revive"] = dict(c)
+            ct = next((x for x in cands if x.idx == c.get("target")), None)
+            self.say("%s 声明：如果勾取成功 → 【%s】%s"
+                     % (hk.tag, p.field.spec.name,
+                        ("救 %s" % ct.tag) if (c.get("mode") == "revive" and ct)
+                        else "选加血"))
 
-
-        # ★★【v0.70 挪位】[勾取]（牛角菱）/ [聚电]（聚电蓝莓）声明【挪到充能之前】。
-        #   用户 2026-10-26 原话："是否勾取应该放在充能阶段之前，然后牛角菱就可以
-        #   在充能阶段声明充能多少。或者说继承聚电蓝莓的所有问询。"
-        #   理由很硬：勾取一旦发生，被勾那株的"充能几颗 / 聚电谁 / 打谁"
-        #   就都该由勾取者答 —— 而充能原来排在勾取【之前】，等于让原主人先答完了，
-        #   勾取者再想改也没有机会。所以顺序必须是：
-        #       释放 → 勾取/聚电 → 充能 → 目标 → 闪电一击
-        #   ⚠️ 结算侧不受影响：真正的"支配权转移"仍在 phase_settle 的
-        #      _hook_pass(stage) 里按步骤兑现（那是另一回事，别混）。
-        self._absorb_declare_phase()
-        # ★★【v0.72】这里原来紧跟一句 self._distribute_absorbed()（当场定归属）。
-        #   用户 2026-10-27 从战报里抓出来："博弈阶段居然就决定闪电草归属了，
-        #   [聚电]这一行为肯定在结算阶段才生效"。
-        #   后果比"顺序不美观"严重得多：没抢到的那一方连"如果聚电成功打谁"
-        #   这道题都不会被问（它的申请在这里就被抹掉了）。
-        #   → 归属挪到 _absorb_resolve_phase 开头，那是"电系：【勾走】结算"那一步。
-
-        # ② 充能【v0.4】：释放了充能植物的玩家同时宣布充能种子数
+    # ---------- 批 4 · 充能 ----------
+    def _declare_charge(self):
+        """已释放的充能植物答"充几颗" —— 声明期唯一当场生效的数值。"""
         chargers = [p for p in self.players
                     if p.alive and p in self.released and p.field is not None
                     and p.field.spec.charge]
-        # ★【v0.71】充能【一律由原主人自己答】（理由同[聚电]：不许代答）。
-        #   被勾取的充能植物，勾取者另有一套"如果勾取成功 → 充几颗"的条件方案
-        #   （_hook_cond_charge），只有勾取兑现时才重做一次。
         if chargers:
-            self.say("—— 充能阶段 ——")
-            _cq = [self._q_charge(p) for p in chargers]
-            ans = self.gather(_cq)
+            self._batch_start("—— 充能 ——")
+            ans = self.gather([self._q_charge(p) for p in chargers])
             for p in chargers:
                 spent = ans.get(p.idx)
                 if not isinstance(spent, int) or isinstance(spent, bool):
                     spent = 0
-                # ★ 记下充能【之前】的数值：勾取兑现后可能要按勾取者的方案重做
+                # 记下充能【之前】的数值：勾取 / 聚电兑现后可能要按新方案重做
                 f = p.field
                 f.pre_charge = (f.fang, f.bao, getattr(f, "flash_chain", False))
-                # ★★【v0.72】充能【之前】的种子数 —— 勾取者的条件方案要按它算。
-                #   用户 2026-10-27："牛角菱选择充能时，聚电蓝莓的种子只剩 19
-                #   （算上聚电蓝莓充能的种子了）"：原主人先充了 6，题面就只剩 19，
-                #   可勾取一旦兑现，那 6 颗是【要退回去】的（_apply_cond_charge），
-                #   所以勾取者看到的必须是 25。
                 f.pre_charge_seeds = p.seeds
                 self._do_charge(p, spent)
-            # 【v0.71】勾取者的条件充能
-            self._hook_cond_charge()
-                # ↑ 上面的应用逻辑抽到 _do_charge() 里了（v0.71）
-
-        # ②b【v0.16】人参果：建立/更新段标记 + 给本回合的累积记账。
-        #     必须排在充能【之后】—— 人参果的充能数就是它要标记的段，
-        #     充能之前压根不知道该记哪一段（见规则文档 10.2）。
+            self._hook_cond_charge()        # 勾取者的"如果勾到就充几颗"
+            self._absorb_cond_charge()      # 聚电支配者的"如果收到就充几颗"
+            self._batch_end()
+        # 人参果段标记：必须排在充能【之后】—— 充能数就是它要标的段
         self._tag_mark_phase()
 
-        # ★★【v0.45 挪位】刀叶类声明【从"攻击之前"挪到"攻击公告之后"】——
-        #   用户 2026-10-15 原话："为了防止欺骗的发生，似乎应该先广播选取目标的
-        #   公告，然后刀类在选取目标。前面好像搞错了。"
-        #   → 于是推翻 v0.37 的"提前"（那一版的理由是"日志读起来顺"），
-        #     改回"先看到打谁、再决定切谁"：信息不完整时先表态，谈不上下注。
-        #   ⚠️ 只改【何时问】；真正的"切"仍在结算阶段【一切攻击之前】
-        #     （_cut_resolve_phase，规则 15.7）。挪后不影响射程：它需要的
-        #     "当前前段"由充能（②）决定，而充能仍排在这之前。详见 结算顺序.txt §7。
-
-        # ③ 目标：所有有攻击的玩家选目标。分三种：
-        #      single   —— 1 发子弹，选 1 个人
-        #      spreader —— 散连击 N：一次选 N 个【不同】的人
-        #      burster  —— 【v0.44】连击 N：一次性把 N 发【分配】给各目标
-        #                  （一道题：给每个目标填发数，合计 = N；可全压一人、可分散）
-        #    ★ v0.9~v0.43 的"连击逐发问 N 次"已废弃 —— 15 发要问 15 次，
-        #      用户 2026-10-12 实测后要求改成一次性分配（见 _q_burst_split）。
-        #      同一批里所有人仍是【同时被问】的。
-        # 【v0.72】目标声明要有自己的小标题 —— 用户 2026-10-27：
-        #   "你的'声明阶段'没有和充能阶段区分开来，[选取目标]和充能
-        #    怎么可能是一个行为呢？"
-        self.say("—— 目标声明（谁打谁 / 谁替谁答）——")
-        shooters = []     # 单选
-        spreaders = []    # 散连击：一次多选
-        bursters = []     # 连击：一次性分配发数
-        cat_splits = []   # 【v0.39】猫尾草：连击 N 发 → 玩家分配到左右两侧
-        # ★★★【v0.74.1】删掉了 v0.39 那个 `cat_tails` 列表 —— 它只被 append、
-        #   从来没人读（_resolve_cat_tail 是从 self.plans 里捞人的），
-        #   于是"推迟到攻击末尾"的猫尾草【整株消失】。
-        #   现在改由 nearest_sides() 当场给出目标（1v1 也能打），不再有"推迟"。
-        # 【v0.58】被[勾取]且这回合会出手的那几株 → 目标由【勾取者】选，
-        #   所以本人这一批不问（见 _hook_proxies / _hook_target_questions）。
+    # ---------- 批 5 · 目标 ----------
+    def _declare_targets(self):
+        """噬魂 · 有收益批 · 普通攻击 —— 三个结算节点合成一批（选目标互不看结果）。"""
+        # 【v0.11】单挑：存活 2 人 → 目标自动锁定；充能 / 水滴照旧要问
+        self._batch_start("—— 目标（噬魂 · 有收益批 · 普通攻击）——")
+        duel = self.duel_auto and self.is_duel()
         proxies = self._hook_proxies()
+        shooters, spreaders, bursters = [], [], []
+        cat_splits = []
         for p in self.players:
             if not p.alive or p not in self.released:
                 continue
             atk = p.field.spec.attack
-            # 【v0.57】103 牛角菱选了【勾取形态】→ 本回合不攻击（防/暴已改成勾取形态的）。
+            # 103 牛角菱选了【勾取形态】→ 本回合不攻击（防/暴已改成勾取形态的）
             if p.field.form == "hook":
                 self.say("%s 的【%s】本回合走【勾取形态】→ 不攻击"
                          % (p.tag, p.field.spec.name))
                 continue
             if p in proxies:
-                # 【v0.71】★ 不再跳过：原主人照常答自己的 —— 勾取一旦没兑现
-                #   （被消除 / 被收走 / 主人中途出局），落地的就是这份。
-                #   勾取者那套"如果勾取成功"的条件方案在 _hook_target_questions。
                 self.say("%s 的【%s】被 %s 勾取 → 若勾取成功，这一击改由勾取者决定"
                          % (p.tag, p.field.spec.name, proxies[p].tag))
             if atk.attr == ATTR_NONE:
@@ -2427,30 +2504,15 @@ class Game:
                 self.say("%s 释放【%s】→ 全体攻击！" % (p.tag, p.field.spec.name))
                 continue
             if not self.others_alive(p):
-                continue  # 防御性检查：没有可选目标就不释放
-            # 【v0.38/v0.39】★ 目标受限的植物（134 猫尾草："目标只能是最靠近自己的
-            #   仍有活着者"）。
-            #   ★★ 用户 2026-10-04 更正（v0.39）：存活环上"最近的"通常【有左右两个】
-            #      （等距），不能替玩家默认挑一个 —— "有三个连击，玩家可以对两侧
-            #      具体选择数量"。即连击 N 发【由玩家分配到左右两侧】。
-            #   ★ 环上只剩 1 侧（或只剩 2 人）→ 全部发数给那一侧，不必问。
-            #   ★ 结算顺序：猫尾草排在【所有攻击之后】（用户 2026-10-04：
-            #     "所有攻击（含火种/段爆发）之后"）—— 因为存活环是实时的，
-            #     它的"最近两侧"必须等到本回合别人都打完、环定型之后再算。
-            #     见 phase_settle 尾部 _resolve_cat_tail()。
+                continue  # 没有可选目标就不释放
             if p.field.spec.nearest_target:
-                # 【v0.74.1】用 nearest_sides：环上只剩 2 人时给那唯一一个活人，
-                #   不再落到"暂缓到攻击末尾"那条死路（v0.39 的 cat_tails 没人读）。
                 sides = self.nearest_sides(p)
                 if not sides:
-                    # 兜底：上面 others_alive() 已经挡掉"一个人都没有"，
-                    #   理论上走不到这儿；真走到了就明说这一击不出手。
                     self.say("%s 释放【%s】→ 环上没有可打的活人，这一击不出手"
                              % (p.tag, p.field.spec.name))
                     continue
                 n = atk.lian if atk.lian > 1 else 1
                 if len(sides) == 1 or n <= 1:
-                    # 只有一侧（或只 1 发）→ 无需问，全给这一侧
                     self.plans[p] = [sides[0]] * n
                     self.say("%s 释放【%s】→ 只有一侧可选：%s（%d 发全部命中）"
                              % (p.tag, p.field.spec.name, sides[0].tag, n))
@@ -2458,8 +2520,6 @@ class Game:
                     cat_splits.append((p, sides, n))
                 continue
             if duel:
-                # 【v0.11】单挑：目标唯一，直接锁定，不弹框。
-                #   连击 N 发【全部】打到这一个人身上（多人局才谈得上分散）。
                 t = self.others_alive(p)[0]
                 n = atk.lian if atk.lian > 1 else 1
                 self.plans[p] = [t] * n
@@ -2472,105 +2532,76 @@ class Game:
                 continue
             if atk.lian > 1:
                 bursters.append(p)
-            # 【v0.74】163 火西瓜：群攻（group_all）走多目标题。
             elif (atk.san > 1 or getattr(p.field.spec, "group_all", False)) \
                     and len(self.others_alive(p)) > 1:
                 spreaders.append(p)
             else:
                 shooters.append(p)
+        # 猫尾草的左右分配排在【批 6】，这里只把要问的记下来
+        self._cat_splits = cat_splits
 
-        # 第一批：单选 / 散连击 / 【v0.44】连击发数分配 / 【v0.46】番茄连接
-        #   ★【v0.46】番茄(107) 的"连谁"也并入【同一批】—— 两者都是"选目标"，
-        #     必须同时下发、收齐后再公告。用户 2026-10-18 报的原话：
-        #     "我在选择目标时已经能看到杨桃选择目标的公告了" ——
-        #     旧版把番茄连接单列一批，于是先问完的那批（攻击者）公告已经播出去了，
-        #     轮到番茄表态时它白拿了别人的目标（信息泄漏，博弈就没了）。
-        #   ★ 公告顺序仍是"先攻击、后连接"（题面同时、播报有先后）。
         qs = [self._q_target(p) for p in shooters]
         qs += [self._q_targets(p) for p in spreaders]
         qs += [self._q_burst_split(p, self.others_alive(p),
                                    p.field.spec.attack.lian) for p in bursters]
-        friend_qs, friend_ctx = self._friend_questions()
-        qs += friend_qs
         ans = self.gather(qs) if qs else {}
-        # 【v0.58】[勾取] 的"如果勾取成功，它打谁"—— 由【勾取者】答。
-        #   ★ 必须在下面那批公告【之前】收齐：否则勾取者能看到别人的目标再表态
-        #     （v0.46 番茄那条踩过的同一个坑）。
-        #   ★ 单独一个 gather 是因为答案按 player_idx 存，同一个人不能在同一批里
-        #     出现两道题。
-        # 【v0.71】不再当场落地 —— 只登记成条件方案，等勾取真的兑现再盖上去
+        # 勾取者的"如果勾取成功，它打谁"：必须和母题【同时收齐】——
+        # 否则勾取者能先看到别人的目标再表态（v0.46 番茄那条踩过的同一个坑）
         self._hook_target_questions()
-        # 【v0.70】[聚电]收为己用：被收走的那株，这一击由最终支配者决定打谁
+        # 聚电的"收来之后打谁"：每个申请人各答一份
         absorbed_jobs = self._absorbed_target_questions()
-        if qs:
-            for p in shooters:
-                cands = self.others_alive(p)
-                idx = ans[p.idx]
-                target = next((c for c in cands if c.idx == idx), cands[0])
-                self.plans[p] = [target]
-                self.say("%s 释放【%s】→ 瞄准 %s" % (p.tag, p.field.spec.name, target.tag))
-            for p in spreaders:
-                cands = self.others_alive(p)
-                picked = []
-                for idx in ans[p.idx]:
-                    t = next((c for c in cands if c.idx == idx), None)
-                    if t is not None:
-                        picked.append(t)
-                self.plans[p] = picked
-                self.say("%s 释放【%s】→ 散连击 %d 人：%s"
-                         % (p.tag, p.field.spec.name, len(picked),
-                            "、".join(t.tag for t in picked)))
-            # 【v0.44】连击：一道题收全部发数 → [[编号, 发数], ...] 展开成 plans[p]。
-            #   ★ 展开后 plans[p] 与老"逐发"写法【完全同形】（就是 N 个目标，
-            #     顺序 = 分配顺序）—— 下游 _resolve_plan / 溅射 / 闪击一字不用改。
-            for p in bursters:
-                cands = self.others_alive(p)
-                by = {c.idx: c for c in cands}
-                seq, cnt, tg = [], {}, []
-                for tidx, c in ans[p.idx]:
-                    t = by.get(tidx)
-                    if t is None or c <= 0:
-                        continue
-                    if t.idx not in cnt:
-                        seq.append(t)
-                    cnt[t.idx] = cnt.get(t.idx, 0) + c
-                    tg += [t] * c
-                if not tg:                      # 兜底（正解合计必 == n；防脚本乱答）
-                    tg, seq, cnt = [cands[0]], [cands[0]], {cands[0].idx: 1}
-                self.plans[p] = tg
-                # 【v0.37】一株一行（"连击 5 发全部打 2 号" / "连击 15 发分配：X 8发、Y 7发"）。
-                if len(seq) == 1:
-                    self.say("%s 释放【%s】→ 连击 %d 发全部打 %s"
-                             % (p.tag, p.field.spec.name, len(tg), seq[0].tag))
-                else:
-                    alloc = "、".join("%s %d发" % (t.tag, cnt[t.idx]) for t in seq)
-                    self.say("%s 释放【%s】→ 连击 %d 发分配：%s"
-                             % (p.tag, p.field.spec.name, len(tg), alloc))
-
+        for p in shooters:
+            cands = self.others_alive(p)
+            idx = ans[p.idx]
+            target = next((c for c in cands if c.idx == idx), cands[0])
+            self.plans[p] = [target]
+            self.say("%s 释放【%s】→ 瞄准 %s" % (p.tag, p.field.spec.name, target.tag))
+        for p in spreaders:
+            cands = self.others_alive(p)
+            picked = []
+            for idx in ans[p.idx]:
+                t = next((c for c in cands if c.idx == idx), None)
+                if t is not None:
+                    picked.append(t)
+            self.plans[p] = picked
+            self.say("%s 释放【%s】→ 散连击 %d 人：%s"
+                     % (p.tag, p.field.spec.name, len(picked),
+                        "、".join(t.tag for t in picked)))
+        for p in bursters:
+            cands = self.others_alive(p)
+            by = {c.idx: c for c in cands}
+            seq, cnt, tg = [], {}, []
+            for tidx, c in ans[p.idx]:
+                t = by.get(tidx)
+                if t is None or c <= 0:
+                    continue
+                if t.idx not in cnt:
+                    seq.append(t)
+                cnt[t.idx] = cnt.get(t.idx, 0) + c
+                tg += [t] * c
+            if not tg:                      # 兜底（正解合计必 == n；防脚本乱答）
+                tg, seq, cnt = [cands[0]], [cands[0]], {cands[0].idx: 1}
+            self.plans[p] = tg
+            if len(seq) == 1:
+                self.say("%s 释放【%s】→ 连击 %d 发全部打 %s"
+                         % (p.tag, p.field.spec.name, len(tg), seq[0].tag))
+            else:
+                alloc = "、".join("%s %d发" % (t.tag, cnt[t.idx]) for t in seq)
+                self.say("%s 释放【%s】→ 连击 %d 发分配：%s"
+                         % (p.tag, p.field.spec.name, len(tg), alloc))
         self._apply_absorbed_targets(absorbed_jobs)
-        # ★【v0.72】absorbed_attacks 原来在这儿赋值 —— 等于"收成了"当既定事实。
-        #   现在由 _absorb_resolve_phase 在【分完归属之后】重建（谁真收到才出手）。
+        self._batch_end()
 
-        # ③d【v0.45 建，v0.46 并批】队友连接声明（107 番茄）的【播报】。
-        #    ★ 题面已经在上面跟着攻击目标【同时下发】了（_friend_questions），
-        #      这里只是把收齐的答案落成 friend_plans + 战报 —— 所以放到攻击公告
-        #      之后播，日志读起来仍是"先打谁、再连谁"。
-        #    ★ 猪笼草的"强制偏移"【不在这里】：这里只收集意图，
-        #      偏移留到结算期（_friend_resolve_phase，挂在⓪ 刀类结算之后）。
-        self._friend_apply_answers(ans, friend_ctx)
-        # ★【v0.72】勾取者的"连谁"条件方案（见 _friend_cond_questions）
-        self._friend_cond_questions(friend_ctx)
-
-        # ③c【v0.45 挪位】刀类声明：从 v0.37 的"攻击之前"挪到"攻击公告之后"。
-        #    ★ 见上面 ★★【v0.45 挪位】那段说明；结算仍在一切攻击之前。
-        self._cut_declare_phase()
-
-        # ③b【v0.27】溅射声明：有溅射的植物，逐个目标声明"往哪侧溅"。
-        #    必须排在 ③ 之后 —— 两侧是【目标】的两侧，目标都还没定，问什么。
+    # ---------- 批 6 · 溅射 · 猫尾草 ----------
+    def _declare_splash_cat(self):
+        """溅射与猫尾草同层：两者都只看批 5 的目标（谁打谁）。"""
+        cat_splits = getattr(self, "_cat_splits", []) or []
+        splash_any = any(p in self.plans and p.field is not None
+                         and p.field.spec.attack.splash for p in self.players)
+        if not (cat_splits or splash_any):
+            return
+        self._batch_start("—— 溅射 · 猫尾草 ——")
         self._splash_declare_phase()
-        # 【v0.39】猫尾草分配：连击 N 发按玩家选择的【左右两侧发数】写进 plans。
-        #   ★ 只写"打算打谁"；实际出手在【所有攻击之后】（见 phase_settle 尾部），
-        #     到那时会按当时的存活环重新确认这两侧是否还活着。
         if cat_splits:
             qs = [self._q_cat_split(p, sides, n) for p, sides, n in cat_splits]
             ans = self.gather(qs)
@@ -2587,7 +2618,7 @@ class Game:
                     t = left if lc else right
                     self.say("%s 释放【%s】→ 连击 %d 发全打 %s"
                              % (p.tag, p.field.spec.name, n, t.tag))
-            # ★【v0.72】勾取者的条件方案（"如果勾取成功，这 N 发怎么分"）
+            # 勾取者的条件方案（"如果勾取成功，这 N 发怎么分"）
             hook_act = self._hook_act_map()
             for p, sides, n in cat_splits:
                 hk = hook_act.get(p)
@@ -2606,15 +2637,38 @@ class Game:
                     self.say("%s 声明：如果勾取成功 → 【%s】连击 %d 发全打 %s"
                              % (hk.tag, p.field.spec.name, n,
                                 (left if lc else right).tag))
+        self._batch_end()
 
-        # 【v0.38】[闪电一击] 声明：与溅射同批（都在 ③ 目标确定之后）。
-        # ★★【v0.74.1 挪位】必须排在【猫尾草分配之后】——
-        #   134 猫尾草的 attack 也带 flash（[闪电一击]），但它的 plans 是在上面
-        #   那段 cat_splits 里才写进去的。这句原来在 cat_splits 之前，
-        #   而 _flash_declare_phase 开头有 `if p not in self.plans: continue`
-        #   → 猫尾草整株被跳过，三发连击的"链弹向哪一侧"一道题都不问
-        #   （用户 2026-11-04 报："猫尾草三个闪电链一条都还没选择往哪弹"）。
+    # ---------- 批 7 · 消除 / 废除 · [闪电一击] ----------
+    def _declare_cut(self):
+        """批 8：消除 / 废除（刀）—— **永远是最后一批**。
+
+        要把**全部**「谁打谁」都看完才决定切谁：攻击目标、溅射的两侧、
+        猫尾草的左右分配、闪电链往哪一侧弹 —— 这些全是"打谁"，都在它前面。
+        """
+        cutters = [p for p in self.players
+                   if p.alive and p in self.released and p.field is not None
+                   and is_knife_class(p.field.spec)]
+        if not cutters:
+            return
+        self._batch_start("—— 消除 / 废除 ——")
+        self._cut_declare_phase()
+        self._batch_end()
+
+    def _declare_flash(self):
+        """批 7：[闪电一击] —— 排在猫尾草之后、刀之前。
+
+        ★ 链弹向哪一侧也是"打谁"的一种，所以它跟溅射 / 猫尾草同属"目标类表态"，
+          必须在【消除 / 废除】之前问完。
+        """
+        flash_any = any(p.alive and p in self.released and p.field is not None
+                        and getattr(p.field, "flash_chain", False)
+                        for p in self.players)
+        if not (flash_any or self.absorb_plans or self.hook_plans):
+            return
+        self._batch_start("—— [闪电一击] ——")
         self._flash_declare_phase()
+        self._batch_end()
 
     def _q_cat_split(self, p, sides, n, by=None, cond=False):
         """【v0.39】猫尾草：把连击 n 发分配给环上左右两侧（两侧各几发）。
@@ -3213,7 +3267,6 @@ class Game:
                     slots.setdefault(k, []).append((p, t, sides))
         if not slots:
             return
-        self.say("—— 溅射声明（两侧分别决定）——")
         for k in sorted(slots):
             batch = slots[k]
             ans = self.gather([self._q_splash(p, t, sides) for p, t, sides in batch])
@@ -3348,7 +3401,6 @@ class Game:
                     jobs.append((p, t, sides, _ans, "absorb", k))
         if not jobs:
             return
-        self.say("—— [闪电一击] 声明（闪电链向两侧之一弹出）——")
         for k in sorted({j[5] for j in jobs}):
             idxs = [i for i, j in enumerate(jobs) if j[5] == k]
             got = self.gather_by_batches(
@@ -3448,7 +3500,6 @@ class Game:
                    and is_knife_class(p.field.spec)]
         if not cutters:
             return
-        self.say("—— 刀叶类：声明要消除谁 ——")
         hook_act = self._hook_act_map()
         for p in cutters:
             spec = p.field.spec
@@ -3485,7 +3536,7 @@ class Game:
     # ==================================================================
     # 【v0.38】电系：「勾走」与 [反馈湮灭]
     # ==================================================================
-    def _absorb_declare_phase(self):
+    def _absorb_declare_all(self):
         """【v0.38】博弈阶段：有"收植物"能力的植物声明收谁。
 
         ★ 原稿 p20：`将[过载喇叭花][闪电草][猫尾草]收为己用，被勾走目标成[空]`。
@@ -3508,20 +3559,14 @@ class Game:
           叫[聚电]吧，以便区分"）—— 与牛角菱的【勾取】是两个机制，日志必须分开。
         ★ 分配细节（同种植物不够分时的平均/随机）见 _distribute_absorbed，仍未落地。
         """
-        # 第一趟：[勾取]（103 牛角菱）—— 勾【两株同名】
-        for p in self.players:
-            if not p.alive or p not in self.released or p.field is None:
-                continue
-            if p.field.spec.hook_same:
-                self._hook_declare(p)
+        # 勾取已经独立成批 2（见 _declare_hook），这里只剩聚电
 
-        # 第二趟：[聚电]（57 聚电蓝莓）—— ★【v0.71】一律【原主人自己答】
+        # [聚电]（57 聚电蓝莓）—— ★【v0.71】一律【原主人自己答】
         #   v0.70 这里让勾取者代答，用户 2026-10-26 当场否掉：
         #     "谁让你代答了？这游戏什么时候允许你代答了？？
         #      谁能在结算之前保证你勾取/聚电一定能成功？"
         #   代答的毛病不只是"越权"：勾取一旦没兑现，被勾那株【连自己的方案都没有】
         #   —— 原主人的声明被勾取者顶掉了，而顶掉它的那个前提又不成立。
-        proxies = self._hook_act_map()
         for p in self.players:
             if not p.alive or p not in self.released or p.field is None:
                 continue
@@ -3767,6 +3812,44 @@ class Game:
                          % (hooker.tag, owner.tag, owner.field.spec.name, v,
                             owner.tag))
 
+    def _absorb_cond_charge(self):
+        """【2026-11-20】聚电的支配者答："如果收成功，让它充几颗"。
+
+        ★ 与 _hook_cond_charge 同构，只是键换成【聚电的申请人】：
+          真收成了，这一株的充能数由支配者定（耗的仍是原主的种子）。
+        ★★ 为什么必须在充能这一批问：被聚电的株【成[空]】之前，
+          bak_bao / bak_fang 会被存下来拿去打出"收为己用"那一击 ——
+          它充了多少，那一击就有多强。等结算再问就晚了。
+        """
+        items = []
+        for caster, fields in self.absorb_plans.items():
+            if not caster.alive:
+                continue
+            for f in fields:
+                if f.player is caster or f.cut_gone or f.inert:
+                    continue
+                if not f.spec.charge:
+                    continue
+                items.append((f, caster,
+                              self._q_charge(f.player, by=caster, cond=True)))
+        if not items:
+            return
+        buckets = {}
+        for it in items:
+            buckets.setdefault(it[1].idx, []).append(it)
+        while any(buckets.values()):
+            batch = [bk.pop(0) for bk in buckets.values() if bk]
+            got = self.gather([b[2] for b in batch])
+            for f, caster, _q in batch:
+                v = got.get(caster.idx)
+                if not isinstance(v, int) or isinstance(v, bool):
+                    v = 0
+                self.cond_abs_charge[(caster.idx, id(f))] = v
+                self.say("%s 声明：如果聚电收到 %s 的【%s】→ 让它充能 %d 颗"
+                         "（扣的是 %s 的种子）"
+                         % (caster.tag, f.player.tag, f.spec.name, v,
+                            f.player.tag))
+
     def _hook_cond_absorb(self):
         """【v0.71】勾取者答："如果勾取成功，让它聚电谁"。"""
         items = []
@@ -3869,6 +3952,11 @@ class Game:
             self.say("  ◇ 勾取兑现 → 【%s】的连击改按 %s 的分配：%s"
                      % (owner.field.spec.name, hooker.tag,
                         "、".join(t.tag for t in cond["cat"]) or "（无）"))
+        if "revive" in cond:
+            # 161 生命之花的"救谁 / 转加血"也是勾取者的轮询之一
+            self.revive_ans[owner] = dict(cond["revive"])
+            self.say("  ◇ 勾取兑现 → 【%s】的复活改按 %s 的选择"
+                     % (owner.field.spec.name, hooker.tag))
         if "friend" in cond:
             self.friend_plans[owner] = dict(cond["friend"])
             _ft = cond["friend"].get("target")
@@ -3876,9 +3964,10 @@ class Game:
                      % (owner.field.spec.name, hooker.tag,
                         ("连 %s" % _ft.tag) if _ft is not None else "空目标（不连人）"))
 
-    def _apply_cond_charge(self, owner, spent):
-        """【v0.71】按勾取者的条件值【重做】一次充能：先把原主人那份退回去。
+    def _apply_cond_charge(self, owner, spent, why="勾取者"):
+        """按支配者的条件值【重做】一次充能：先把原主人那份退回去。
 
+        ★ why = "勾取" / "聚电"，只影响播报措辞。
         ★ 为什么安全：pre_charge 是充能【之前】的 (fang, bao, flash_chain) 快照，
           而充能之后到结算之间没有任何一步会改这三个值。
         """
@@ -3889,7 +3978,8 @@ class Game:
         owner.seeds += int(getattr(f, "charge_spent", 0) or 0)
         f.fang, f.bao, f.flash_chain = pre
         self._do_charge(owner, spent)
-        self.say("  ◇ 充能按勾取者的方案重做 → %d 颗（退回去再按新数扣）" % spent)
+        self.say("  ◇ 充能按%s的方案重做 → %d 颗（退回去再按新数扣）"
+                 % (why, spent))
 
     def _first_action_stage(self, f):
         """这株植物【最早在哪一步真的做事】—— 只给 _hook_pass 用。
@@ -4509,6 +4599,14 @@ class Game:
                 #   不存的话闪电草打出去是"削防0"：成空把 bao 也清零了,
                 #   而那一击本该按它自己的攻击力算（暴 7）。
                 #   只存第一次（同一株被两家抢时，别被第二次的清零覆盖）。
+                # ★ 【2026-11-20】支配者可能再往上一层（勾取链），先算出来：
+                #   聚电的"充几颗"要按【最终支配者】那份条件方案重做。
+                _boss = self._final_controller(owner)
+                _k = next((kk for kk in ((_boss.idx, id(f)), (owner.idx, id(f)))
+                           if kk in self.cond_abs_charge), None)
+                if _k is not None:
+                    self._apply_cond_charge(f.player, self.cond_abs_charge[_k],
+                                            why="聚电支配者")
                 if not getattr(f, "absorbed", False):
                     f.bak_bao = f.bao
                     f.bak_fang = f.fang
@@ -4534,7 +4632,6 @@ class Game:
                 #   也被别人[勾取]了（用户这局：真人2 的聚电蓝莓被真人1 勾取，
                 #   它再聚电闪电草 → 闪电草该归真人1，不是真人2）。
                 #   支配链要一路往上追（_final_controller），否则日志自相矛盾。
-                _boss = self._final_controller(owner)
                 self.say("  · %s 的【%s】被 %s 聚电收走 → 成[空]（该植物的出手改由 %s 决定%s）"
                          % (f.player.tag, f.spec.name, owner.tag, _boss.tag,
                             "" if _boss is owner else "（%s 已被 %s 支配，一路追到最终支配者）"
@@ -5177,7 +5274,7 @@ class Game:
         if spec.charge_tag:
             if field.tag_seg:
                 return field.tag_seg
-            return int(spec.no[0]) if spec.no else None
+            return self._seg_of_no(spec.no)
         # 充能类 + 房间选项开着 → 前段 = 耗种 + 充能数（本回合充了多少）。
         #   ★ charge_seg_var 是房间规则，归属"这局怎么算"，所以引擎读规则是正当的；
         #     但它只决定【用哪条公式】，不写死任何一个植物的数字。
@@ -5185,7 +5282,23 @@ class Game:
             return spec.cost_seed + (field.charge_spent or 0)
         if not spec.no:
             return None
-        return int(spec.no[0])
+        return self._seg_of_no(spec.no)
+
+    @staticmethod
+    def _seg_of_no(no):
+        """编号 → 【前段】。
+
+        ★★ 编号 = 【耗种·序号】拼起来的：最后一位是序号，前面全是耗种。
+           "35" → 3；"134" → 13；"01" → 0。
+        ★ 这里原来是 int(no[0]) —— 只读第一位，于是**所有三位编号的植物
+          都被当成前段 1**：猫尾草 134→1、火西瓜 163→1。
+          后果：金刚刀叶（射程 >6）对它们永远没有候选（用户 2026-11-20 报的
+          "1号出了刀却一道题都没被问"），大刀叶反而切得动它们（1 落在 0~5 里）。
+        ★ 前段只有这一个算法 —— 刀叶射程 / 免切① / 人参果段 都读它。
+        """
+        if not no or not no.isdigit():
+            return None
+        return int(no) // 10
 
     def _seg_of(self, p):
         """这个人的【当前前段】（兼容老调用）；没有则 None。"""

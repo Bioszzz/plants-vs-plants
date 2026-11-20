@@ -566,20 +566,22 @@ class Mirror:
         except Exception as e:      # noqa: BLE001 —— 本地算炸了不能让页面卡死
             # 【v0.77】算不出来 = 有 Bug（同一串输入，服务端算得出、本地算不出，
             #   多半是引擎/数据不一致）。处理顺序：先说人话 → 立刻自愈 → 留证据。
-            self.bus.push({"type": "msg",
-                           "text": "（本地重算失败：%s\n"
-                                   "  这是个 Bug，不是你操作错。已经切回『服务器直接发战报』，"
-                                   "这一局照常继续。\n"
-                                   "  想帮上忙的话：点右上角「⭳ 录像」把这一局导出来，发给作者。）" % e})
-            self.push_events = False
-            if self.on_broken is not None:
-                try:
-                    self.on_broken(e)
-                except Exception:   # noqa: BLE001 —— 自愈动作本身失败也不许再炸
-                    pass
+            self._degrade(e)
             return
         with self._lock:
             start = self.shown
+            # ★★【2026-11-20】重跑出来的战报【比上次还短】= 两边已经分叉。
+            #   同一串答案重跑只会越跑越长；变短说明"这一次重跑在该问的地方
+            #   没问、答案落到了别的题上"—— 2026-11-20 那次就是这么空白的：
+            #   引擎把三位编号的前段算成 1 → 该出的刀题没出 → 本地和服务端
+            #   的问题序列对不上 → 战报停在那儿不动，玩家看着就是"卡死"。
+            #   真遇到就立刻降级，别再静默地什么都不推。
+            if len(lines) < start:
+                self.shown = len(lines)
+                self._degrade("本地重算的战报比上一版还短（%d < %d）—— "
+                              "本地和服务端的问题序列分叉了"
+                              % (len(lines), start))
+                return
             self.shown = len(lines)
         if not self.push_events:
             # 只存盘、不推：服务端会自己发战报和场面，别重复
@@ -600,6 +602,21 @@ class Mirror:
                 self.bus.push({"type": "state", "state": last})
         if self.save_file:
             self._save(running=True)
+
+    def _degrade(self, err):
+        """本地算不出来 / 算得不对 → 说人话 + 立刻切回"服务器发战报"。"""
+        self.bus.push({"type": "msg",
+                       "text": "（本地重算失败：%s\n"
+                               "  这是个 Bug，不是你操作错。已经切回『服务器直接发战报』，"
+                               "这一局照常继续。\n"
+                               "  想帮上忙的话：点右上角「⭳ 录像」把这一局导出来，发给作者。）"
+                               % err})
+        self.push_events = False
+        if self.on_broken is not None:
+            try:
+                self.on_broken(err)
+            except Exception:   # noqa: BLE001 —— 自愈动作本身失败也不许再炸
+                pass
 
     # ---------- 存 ----------
     def _save(self, running=False):
