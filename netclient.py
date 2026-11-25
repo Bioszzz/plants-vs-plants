@@ -131,21 +131,35 @@ def handle_ask(sock, m):
         own = m.get("own") or {}
         _print_qfrom(m, own)
         # 【v0.8】散连击：一次选 count 个不同的人
+        # 【v0.77.1】群攻（default_all）：默认全选、可逐个取消，**也可以一个都不选** ——
+        #   直接回车 = 空目标（这一击不打人；它别的效果照常结算）。
         n = m["count"]
-        print("散连击：请选出 %d 个不同的目标（每人挨 1 击）" % n)
+        group = bool(m.get("default_all"))
+        if group:
+            print("群攻：候选 %d 人（默认全选）。输入要打的人；直接回车 = 空目标" % n)
+        else:
+            print("散连击：请选出 %d 个不同的目标（每人挨 1 击）" % n)
         for c in m["cands"]:
             print("  %d. %s｜生命%s｜场上：%s(防%d)"
                   % (c["idx"], c.get("name_tag") or c["name"], c["hp"], c["plant"], c["fang"]))
         while True:
-            s = input("输入 %d 个玩家编号，空格或逗号隔开：" % n).strip()
+            if group:
+                s = input("输入玩家编号（空格或逗号隔开；回车=空目标）：").strip()
+                if not s:
+                    v = []
+                    break
+            else:
+                s = input("输入 %d 个玩家编号，空格或逗号隔开：" % n).strip()
             parts = [x for x in s.replace(",", " ").replace("，", " ").split() if x]
-            if len(parts) == n and all(x.lstrip("-").isdigit() for x in parts):
+            lo, hi = (1, n) if group else (n, n)
+            if lo <= len(parts) <= hi and all(x.lstrip("-").isdigit() for x in parts):
                 v = [int(x) for x in parts]
-                if len(set(v)) == n:
+                if len(set(v)) == len(v):
                     break
                 print("不能选同一个人两次。")
             else:
-                print("要正好输入 %d 个数字编号。" % n)
+                print("要输入 1~%d 个不同的数字编号。" % n if group
+                      else "要正好输入 %d 个数字编号。" % n)
         send_answer(sock, v)
     elif kind == "burst_split":
         own = m.get("own") or {}

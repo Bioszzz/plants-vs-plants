@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import netproto
 from bots import BotController
-from engine import Controller, Game, Observer, PENDING, UndoRequest
+from engine import Controller, Game, Observer, PENDING, UndoRequest, RedoRequest
 from replay import HybridController, ReplayError
 from plants_data import (DEFAULT_RULES, normalize_rules, describe_rules,
                          rule_options)
@@ -323,6 +323,31 @@ class ConsoleBus:
         self.push({"type": "msg", "text": text})
 
 
+def head_payload(game):
+    """【v0.77.1】这一局的"头"：人数 / 名字 / 种子 / 规则 / 牌库 + **已有的答案**。
+
+    ★★ 为什么必须带 answers —— v0.76 这里把 answers 清成了 []，于是：
+      回退重建后服务端是"带着前 N 题"重开的（carry），客户端却从空局重算：
+      卡面停在上一回合（火西瓜还写着防 16，实际已成[空]）、战报的回合数
+      差一整回合，再往后一回合就地题型错位
+      （`第 2 题对不上：录像里 1 号答的是【plant】，当前版本问的是【targets】`）。
+      2026-11-25 实机撞到，见 开发文档.txt 第十章。
+
+    ★ 头只在【开局 / 回退重建】发一次；之后是 rep_rows 增量。
+      带着 carry 发一次不占什么带宽（一局总共才 2~5 KB），却是本地和服务端
+      "看到同一局"的唯一办法。
+    """
+    try:
+        data = game.replay_dict()
+    except Exception:          # noqa: BLE001
+        return None
+    if not data:
+        return None
+    head = dict(data)
+    head["answers"] = [dict(r) for r in (data.get("answers") or [])]
+    return head
+
+
 # ======================================================================
 #  房间：一局对局的状态机
 # ======================================================================
@@ -391,9 +416,18 @@ class Room:
         # 【v0.76】续玩：拿一份录像当前缀（None = 正常开局）。开局时由 start() 填。
         self.resume = None
         # 【v0.76】录像落盘开关（内存录制不受它影响）。
+        # 【v0.77.1】record_default 是"这个进程默认要不要落盘"（`--no-record` 设它），
+        #   控制台点「开局」走的那条路不传 record，就得靠它 —— 否则测试起的
+        #   netserver 还是会把每一局写进 对局录像/。
         self.record = True
+        self.record_default = True
         # 【v0.76】局终回退：刚打完那一局的赢家名单（撤战绩时按名字减回去）
         self._last_win_names = []
+        # 【v0.77.1】重做点（Ctrl+Y）：每次回退之前，把"完整的那串答案"压进来。
+        #   回退把答案截短了，这一份就是"原来有多长"的凭据 —— 重做时拿它重建。
+        #   ★ 一旦有人答了新题（_push_rows 收到新行）就整摞清掉：
+        #     那时"未来"已经变了，重做回去等于放出另一条时间线。
+        self._undo_stack = []
 
     def request_undo(self, at=None):
         """【v0.76】请把这一局退回「第 at 回合开始」（at=None = 本回合，0 = 从开局重来）。
@@ -411,6 +445,28 @@ class Room:
         if isinstance(at, str) and at.strip().lower() in ("prev", "-1", "上一回合"):
             at = max(0, g.round - 1)
         g.request_undo(at)
+        return True, None
+
+    def request_redo(self):
+        """【v0.77.1】把上一次回退重做回来（Ctrl+Y）。
+
+        和 request_undo 一样只是打招呼：真正的重建在 _play_one 接住
+        RedoRequest 之后发生，喂的是压栈时存下的"完整那串答案"。
+
+        ★ 什么时候不能重做：
+          · 没有对局在跑（局终那条路走 playtest 的 resume，见 Lab.request_redo）；
+          · 栈是空的（没回退过，或者已经重做完了）；
+          · 回退之后有人答了新题 → _push_rows 已经把栈清空（"未来"变了）。
+        """
+        with self._lock:
+            g, st = self.game, self.state
+            rows = list(self._undo_stack[-1]) if self._undo_stack else None
+        if g is None or st != "playing":
+            return False, "现在没有正在进行的对局"
+        if not rows:
+            return False, "没有可以重做的回退（回退之后已经有人答过新题，就没法重做了）"
+        if not g.request_redo(rows):
+            return False, "重做请求没被引擎收下（答案为空？）"
         return True, None
 
     def rewind_stats(self):
@@ -437,20 +493,16 @@ class Room:
     def _push_head(self, game):
         """【v0.76】把"这一局的头部"发给要自己跑引擎的客户端。
 
-        只发 head（不含 answers）：人数 / 名字 / 开局种子 / 房间规则 / 牌库 /
-        duel_auto。客户端凭它 + 后续增量答案，就能在本地重跑出**逐字相同**的战报。
+        头部 = 人数 / 名字 / 开局种子 / 房间规则 / 牌库 / duel_auto
+             + **已经答过的那些题**（见 head_payload 的说明）。
 
-        ★ 回退 / 续玩会重建 Game，这里会再发一次 —— 客户端收到 head 就清空
-          本地累积的答案重来（旧的那串已经作废了）。
+        ★ 回退 / 续玩会重建 Game，这里会再发一次 —— 客户端收到 head 就
+          【用这一份替换掉本地累积的答案】。别清成空表：清掉之后本地是从
+          第 0 回合重算的，而服务端已经从回退点接着跑了。
         """
-        try:
-            data = game.replay_dict()
-        except Exception:          # noqa: BLE001
+        head = head_payload(game)
+        if not head:
             return
-        if not data:
-            return
-        head = dict(data)
-        head["answers"] = []
         with self._lock:
             cs = list(self._controllers or [])
         for c in cs:
@@ -469,6 +521,13 @@ class Room:
         """
         with self._lock:
             cs = list(self._controllers or [])
+            # 【v0.77.1】有人答了新题 → 重做点整摞作废："未来"已经变了，
+            #   再把旧的那串还回去等于放出另一条时间线（Ctrl+Z 之后打字，
+            #   Ctrl+Y 就该失效 —— 同一个道理）。
+            #   ★ 快进背出来的历史答案不会走到这里（引擎只把"真正新记下来的"给钩子），
+            #     所以重做本身不会把自己的栈清掉。
+            if rows and self._undo_stack:
+                self._undo_stack = []
         targets = [c for c in cs
                    if isinstance(c, RemoteController) and c.needs_rows]
         if not targets:
@@ -630,7 +689,7 @@ class Room:
 
     # ---------- 开局 ----------
     def start(self, total=2, bots=0, start_seeds=0, game_port=8080, rules=None,
-              resume=None, record=True):
+              resume=None, record=None):
         # 【v0.63】服务端打完一局【不退出】，此时 state 还是 waiting（replay_ready）——
         #   房主改完参数点「开局」时，必须先把那个"等下一局"的循环收掉：
         #   端口还被他占着，不先关就 bind 不上。
@@ -689,7 +748,10 @@ class Room:
             self.resume = open_data          # None = 正常开局
             # 【v0.76】要不要把录像【落盘】。内存里的录制永远开（回退依赖它），
             #   这个开关只管"局末/每回合写不写文件"。
-            self.record = bool(record)
+            #   record=None（没传）= 用本进程的默认值（`--no-record` 时是 False）。
+            self.record = bool(self.record_default if record is None else record)
+            # 【v0.77.1】新的一局开始 → 上一局的重做点全作废（答案串已经换了）
+            self._undo_stack = []
             self.joined = 0
             self.winner, self.error = None, ""
             self.winners = []
@@ -941,14 +1003,18 @@ class Room:
         # ==========================================================
         undo_rows = None       # None = 从头开始；list = 快进用的录像
         replay_seed = None
-        duel_auto = True
+        # 【v0.77.1】None = "由房间规则「全神贯注」决定"（新开一局一律如此）；
+        #   续玩老录像时才用录像里那个值，否则当年锁定的局重放不出来。
+        duel_auto = None
         playable = None
         if resume:
             # 【v0.76】续玩 = "把整份录像当回退目标"：同一套快进逻辑，
             #   只是 carry 是全部答案，所以快进到录像截止处就轮到真人。
             undo_rows = [dict(r) for r in (resume.get("answers") or [])]
             replay_seed = int(resume["rng_seed"])
-            duel_auto = bool(resume.get("duel_auto", True))
+            # ★ 老录像（v0.77 及以前）没有 focus 规则，只有 duel_auto 这个字段
+            #   —— 它记的正是当年那个值，原样交回去才对得上。
+            duel_auto = resume.get("duel_auto")
             import replay as _replay
             playable = _replay.clean_playable(resume.get("playable"))
         game = None
@@ -996,22 +1062,39 @@ class Room:
                 game.run()
                 break
             except UndoRequest as _u:
-                # 算"退到哪"：目标是"第 N 回合开始" → 只留 r < N 的答案。
-                #   ★ 以前固定用 game.round（只能退本回合）；现在玩家可以指定
-                #     任意回合，甚至 0（= 从开局重来），所以以请求里的 at 为准。
-                _target = getattr(_u, "at", None)
-                if not isinstance(_target, int):
-                    _target = game.round
-                _target = max(0, min(_target, game.round))
-                rows = game.record.get("answers") or []
-                keep = [r for r in rows if r.get("r", 0) < _target]
-                undo_rows = keep
+                # 【v0.77.1】两种请求走同一条重建通道，只有"喂哪串答案"不同：
+                #   回退 = 截断后的前缀（r < N）；重做 = 回退之前那一整串。
+                _is_redo = isinstance(_u, RedoRequest)
+                if _is_redo:
+                    undo_rows = [dict(r) for r in _u.rows]
+                    with self._lock:
+                        if self._undo_stack:
+                            self._undo_stack.pop()      # 这个重做点用掉了
+                    _target = int(undo_rows[-1].get("r", 1) or 1) if undo_rows else 0
+                else:
+                    # 算"退到哪"：目标是"第 N 回合开始" → 只留 r < N 的答案。
+                    #   ★ 以前固定用 game.round（只能退本回合）；现在玩家可以指定
+                    #     任意回合，甚至 0（= 从开局重来），所以以请求里的 at 为准。
+                    _target = getattr(_u, "at", None)
+                    if not isinstance(_target, int):
+                        _target = game.round
+                    _target = max(0, min(_target, game.round))
+                    rows = game.record.get("answers") or []
+                    keep = [r for r in rows if r.get("r", 0) < _target]
+                    # 【v0.77.1】真截掉了东西才记重做点（没截 = 本来就在本回合开始）
+                    if len(keep) < len(rows):
+                        with self._lock:
+                            self._undo_stack.append([dict(r) for r in rows])
+                    undo_rows = keep
                 # 客户端手里那段战报已经播出去了（没法撤回）→ 索性清空重播。
                 # 重播走的是同一条广播通道，只是速度快得多（没人等待）。
-                _reset = {"type": "reset",
-                          "text": ("—— 已回退到第 %d 回合开始，战报重新播放 ——" % _target)
-                                  if _target > 0 else
-                                  ("—— 已回到开局（第 0 回合），战报重新播放 ——")}
+                if _is_redo:
+                    _text = "—— 已重做（第 %d 回合），战报重新播放 ——" % _target
+                elif _target > 0:
+                    _text = "—— 已回退到第 %d 回合开始，战报重新播放 ——" % _target
+                else:
+                    _text = "—— 已回到开局（第 0 回合），战报重新播放 ——"
+                _reset = {"type": "reset", "text": _text}
                 for c in controllers:
                     if isinstance(c, RemoteController):
                         try:
@@ -1019,8 +1102,12 @@ class Room:
                         except (OSError, ConnectionError):
                             pass
                         c.drop_pending_answers()      # 倒掉快进期间的旧答案
-                self.bus.emit("—— 回退：重跑前 %d 条答案，回到第 %d 回合 ——"
-                              % (len(keep), _target))
+                if _is_redo:
+                    self.bus.emit("—— 重做：恢复 %d 条答案，接着往下打 ——"
+                                  % len(undo_rows))
+                else:
+                    self.bus.emit("—— 回退：重跑前 %d 条答案，回到第 %d 回合 ——"
+                                  % (len(undo_rows), _target))
                 continue
             except (ConnectionError, OSError) as e:
                 aborted = True
@@ -1228,6 +1315,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             ok, err = self.room.request_undo()
             return self._json({"ok": ok, "err": err, "status": self.room.status()})
 
+        # 【v0.77.1】重做（Ctrl+Y）：把上一次回退还回去。同样是"打个招呼"。
+        if path == "/api/host/redo":
+            ok, err = self.room.request_redo()
+            return self._json({"ok": ok, "err": err, "status": self.room.status()})
+
         if path == "/api/host/stop":
             ok, err = self.room.stop()
             return self._json({"ok": ok, "err": err, "status": self.room.status()})
@@ -1341,6 +1433,8 @@ USAGE = """用法：
                                                同一端口就是下一局（座位名/战绩保留）
   python netserver.py --console-port 9000      控制台端口（默认 8090，被占自动往后找）
   python netserver.py --no-console             不起控制台
+  python netserver.py --no-record              【测试用】不往 对局录像/ 落盘
+                                               （内存录制照旧，回退仍然能用）
   python netserver.py --rule mult_cap=0        房间规则（可重复；这里 = 丝瓜王朝不封顶）
 
 """ + "\n".join(_rules_usage_lines())
@@ -1353,13 +1447,20 @@ def parse_args(argv):
            "console": True, "console_port": 8090, "open": False, "rules": {},
            # 【v0.63】带位置参数时默认"打完一局就退出"（脚本/测试依赖这条）；
            #   --keep 改成"打完回到等人、客户点重连就下一局"。
-           "keep": False}
+           "keep": False,
+           # 【v0.77.1】要不要把录像落盘。测试里关掉：八道测试每跑一轮会往
+           #   对局录像/ 里丢十几份 player1/player2 的局，把玩家的真局淹掉
+           #   （2026-11-25：176 份里 172 份是测试产生的）。
+           #   ★ 只关"落盘"，内存里的录制照旧 —— 回退靠它。
+           "record": True}
     pos = []
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--no-console":
             opt["console"] = False
+        elif a == "--no-record":
+            opt["record"] = False
         elif a == "--rule" and i + 1 < len(argv):
             # 【v0.25】房间规则：--rule 键=值（可重复）。值一律当数字（本版只有
             #   数值型开关）；写坏的键/值不在这里报错 —— 交给 normalize_rules
@@ -1425,6 +1526,9 @@ def main():
 
     bus = ConsoleBus()
     room = Room(bus, host_ip=lan_ip())
+    # 【v0.77.1】`--no-record`：本进程所有开局都不往 对局录像/ 落盘
+    #   （测试起服务端时用；控制台点「开局」那条路也走这个默认值）。
+    room.record_default = bool(opt["record"])
 
     console, console_port = None, None
     if opt["console"]:

@@ -40,6 +40,8 @@ from plants_data import (PLANTS, EMPTY, PLAYABLE, ATTR_NONE,
                         # 【v0.32】刀类：判据 / 数值常量
                         # 【v0.36】新增 is_bladeleaf_class（连切只给刀叶类）
                         is_knife_class, is_bladeleaf_class, is_jingang, is_durian,
+                        # 【v0.77.1】[点名]名单匹配（85 玉米爆裂弹 / 109 火龙果）
+                        named_match_any,
                         CUT_SELF_WOUND_AT, CUT_SELF_WOUND,
                         # 【v0.38】电系：[闪电链] 数值 + [不灭]/[反馈湮灭] 判据
                         FLASH_CHAIN_BAO, FLASH_CHAIN_DAMAGE,
@@ -824,6 +826,24 @@ class UndoRequest(Exception):
         self.at = at        # None = 退回到"本回合开始之前"（由调用方算）
 
 
+class RedoRequest(UndoRequest):
+    """【v0.77.1】把"上一次回退"重做回来（Ctrl+Y）。
+
+    ★ 为什么继承 UndoRequest：对调用方来说两者是同一件事 —— 都是
+      "换一串答案把这一局重建 + 快进"。差别只在**用哪一串**：
+        回退 = 截断后的前缀（r < N）     ← 少了几条
+        重做 = 回退之前那一整串（含被截掉的）← 把少掉的那几条还回去
+      所以 netserver 的重建循环一行都不用分叉，它只认"要喂哪串答案"。
+    ★ 为什么不做成"再跑一遍那几个动作"：那等于把牌局按另一条路重算一遍，
+      规则里的随机（发牌顺序、同编号谁先出手）就未必对得上 —— 而这些
+      答案本身就是"当时那一局"的唯一凭据。
+    """
+
+    def __init__(self, rows):
+        super().__init__(None)
+        self.rows = [dict(r) for r in (rows or [])]
+
+
 def answer_out(v):
     """答案 → 可 JSON 化的形式。Player → 编号；列表逐项折；其余原样。"""
     if isinstance(v, Player):
@@ -855,7 +875,7 @@ def answer_in(v, players):
 
 
 class Game:
-    def __init__(self, controllers, playable=None, output=None, duel_auto=True,
+    def __init__(self, controllers, playable=None, output=None, duel_auto=None,
                  rng=None, observers=None, start_seeds=0, rules=None,
                  player_names=None, rng_seed=None):
         self.controllers = list(controllers)
@@ -875,11 +895,17 @@ class Game:
         self.observers = list(observers) if observers else []
         self.playable = list(playable) if playable else PLAYABLE
         self._output = output  # 广播输出函数；热座版传 print，网络版留空用 notify 逐个投递
-        # 【v0.11】单挑模式开关：存活人数 == 2 时略过"确认释放"和"指定目标"两环节。
-        #   你的原话："两人单挑时一般不涉及多人博弈"。默认开启；
-        #   传 False 恢复完整流程（回归测试用它对照旧行为）。
-        #   注意判定是【运行时】的：3 人局打到只剩 2 人也会自动进入单挑模式。
-        self.duel_auto = duel_auto
+        # 【v0.11】单挑模式开关：存活人数 == 2 时略过"指定目标"这一环节。
+        #   你的原话："两人单挑时一般不涉及多人博弈"。
+        #   ★★【v0.77.1】它不再是"写死为开"了 —— 改由房间规则「全神贯注」(focus)
+        #     决定，和「战斗！爽」取代"单挑自动释放"是同一个动作
+        #     （用户 2026-11-25："单挑自动锁定这个之前不是让废除抽出来规则集吗？
+        #      我起个名字吧，就叫'全神贯注'"）。默认【关】= 1v1 也照常问打谁。
+        #   · duel_auto=None（新代码一律这样）→ 读 rules["focus"]；
+        #   · 显式传 True/False（老测试、老录像回放）→ 以参数为准，保持兼容。
+        #   ★ 判定是【运行时】的：3 人局打到只剩 2 人也会自动进入单挑模式。
+        #   ⚠️ 真正赋值在下面 rules 归一化之后（这里只留参数）。
+        _duel_arg = duel_auto
         # 【v0.21】随机源：只用在"同一个噬魂植物抢同一个目标"时的先后顺序上。
         #   为什么做成 Game 的成员而不是直接 random.shuffle：测试要可复现 ——
         #   传一个 random.Random(0) 进来，随机顺序就固定了（见 Test56）。
@@ -910,6 +936,10 @@ class Game:
         self._phase = ""
         # 【v0.76】回退请求：有人按了「回退」就置上，等下一个 gather 轮询时抛出去。
         self.undo_at = None
+        # 【v0.77.1】重做请求：把上一次回退还给人家（Ctrl+Y）。
+        #   存的是"回退之前那一整串答案"（含被截掉的那几条）——
+        #   和回退走同一套重建 + 快进，只是喂的串更长。
+        self.redo_rows = None
         # 【v0.76】每回合结束的回调（可选）——服务端拿它做"中途自动保存"。
         #   签名 f(game)。★ 回调里抛的异常会被吞掉：存录像失败绝不许影响对局，
         #   这条和"战报播不出来不许挡住结算"是同一个道理。
@@ -940,6 +970,11 @@ class Game:
         #     plants_data.DEFAULT_RULES；这里只负责把脏数据折成合法值。
         #   归一化在 normalize_rules 里做（负数夹 0、未知键忽略、脏数据退回默认）。
         self.rules = normalize_rules(rules)
+        # 【v0.77.1】"全神贯注"落地点：只有这一处把"单挑要不要自动锁目标"定下来。
+        #   ★ 别在别处再写一次 `self.rules["focus"]` —— 那会变成"同一件事两个落点"
+        #     （本项目的老坑）；别处只许读 self.duel_auto。
+        self.duel_auto = (bool(self.rules.get("focus")) if _duel_arg is None
+                          else bool(_duel_arg))
         self.over = False
         self.winner = None
         # 【v0.45】获胜者名单（"同一连通分图 → 该方【全体】获胜"）。
@@ -1114,7 +1149,11 @@ class Game:
             elif f.spec is EMPTY:
                 fp = "空"
             else:
-                if f.broken:
+                # 【v0.77.1】被消除 / 废除 / 毁灭的株先判 —— 它也 inert，
+                #   旧写法会显示成"未释放·属性归零"（玩家会以为自己点错了）。
+                if f.cut_gone:
+                    extra = "，成[空]"
+                elif f.broken:
                     extra = "，已被击破"
                 elif f.inert:
                     extra = "，未释放·属性归零"   # 【v0.7】
@@ -1207,6 +1246,9 @@ class Game:
             else:
                 d["plant"] = {"name": f.spec.name, "fang": f.fang,
                               "broken": f.broken, "inert": f.inert,
+                              # 【v0.77.1】成[空] 也是 inert，前端必须能分辨
+                              #   （否则被消除的牌显示成"未释放"，看着像玩家点错了）
+                              "cut_gone": f.cut_gone,
                               "desc": f.spec.desc}
             out["players"].append(d)
         # 【v0.16】人参果段标记（给图形界面画"埋雷状态"，命令行走上面的文本）
@@ -1433,11 +1475,12 @@ class Game:
                  % (dead.tag, total,
                     "、".join("%s（%s）%d 颗" % (r.tag, lab, n)
                               for lab, r, n in allot)))
-        # ★ 下发前先刷新一次场面：此刻死者已退出存活环、种子还没转走。
-        #   不刷新的话，界面上他还站在环里，却被问"你的种子分给谁"——
-        #   自相矛盾（用户 2026-10-19 截图里就是这样）。
+        # 【2026-11-25】★ 不再问死者"怎么分"。用户原话："种子的分配不应该默认由
+        #   死亡者决定" —— 谁有资格接（[种子锁]）是规则决定的，不是死者挑的。
+        #   暂时按默认[平均分配]落地（split_evenly：除不尽时余数随机，每人最多 +1）。
+        #   ⚠️ `seed_heir` 这个题型和它的四端界面暂时留着（不再下发），
+        #   等[种子锁]/[队友锁]落地时一起决定是删还是改。
         self.say_state()
-        allot = self._ask_seed_heir(dead, total, allot)     # 可改，默认 = 上面这份
         for _lab, r, n in allot:
             if n > 0:
                 r.seeds += n
@@ -1746,6 +1789,9 @@ class Game:
             # 【v0.76】有人按了「回退」→ 就在这里停住（等答案是唯一合法打断点）。
             if self.undo_at is not None:
                 raise UndoRequest(self.undo_at)
+            # 【v0.77.1】重做：同一个打断点，喂的是"回退之前那一整串"
+            if self.redo_rows is not None:
+                raise RedoRequest(self.redo_rows)
             for q in list(pending):
                 v = self.controllers[q.player_idx - 1].poll()
                 if v is PENDING:
@@ -1832,6 +1878,18 @@ class Game:
         if target > self.round:
             target = int(self.round)      # 不许"退"到还没走到的回合
         self.undo_at = target
+        return True
+
+    def request_redo(self, rows):
+        """【v0.77.1】外部（按钮 / HTTP 接口）调用：把上一次回退重做回来。
+
+        rows：回退**之前**那一整串答案（含被截掉的那几条）—— 调用方存着的那份。
+        ★ 和 request_undo 一样，这里只是【打个招呼】：真正的动作在 gather 的
+          轮询循环里抛 RedoRequest，由调用方重建。
+        """
+        if not isinstance(rows, (list, tuple)) or not rows:
+            return False
+        self.redo_rows = [dict(r) for r in rows]
         return True
 
     def replay_dict(self):
@@ -2262,7 +2320,8 @@ class Game:
             self._declare_targets()        # 批 5  噬魂 · 有收益批 · 普通攻击
             self._declare_splash_cat()     # 批 6  溅射 · 猫尾草
             self._declare_flash()          # 批 7  [闪电一击]
-            self._declare_cut()            # 批 8  消除 / 废除（永远是最后一批）
+            self._declare_cut()            # 批 8  消除 / 废除（刀）
+            self._declare_named()          # 批 9  点名群攻（玉米爆裂弹 · 火龙果）
         finally:
             while self._quiet_stack:
                 self._batch_end()
@@ -2485,6 +2544,10 @@ class Game:
         proxies = self._hook_proxies()
         shooters, spreaders, bursters = [], [], []
         cat_splits = []
+        # 【v0.77.1】asked = 这一批【真的会出手】的人（含全体攻击 / 猫尾草）——
+        #   条件方案（"如果勾取成功，它打谁"）按这个集合分发：
+        #   批 5 问一半、批 9 问另一半，谁也别把对方的人顺手问掉。
+        asked = set()
         for p in self.players:
             if not p.alive or p not in self.released:
                 continue
@@ -2499,11 +2562,17 @@ class Game:
                          % (p.tag, p.field.spec.name, proxies[p].tag))
             if atk.attr == ATTR_NONE:
                 continue
+            # 【v0.77.1】[点名]群攻（85 玉米爆裂弹 / 109 火龙果）——
+            #   它们的目标题在【批 9】，排在刀之后（用户 2026-11-25：
+            #   "这两个东西对刀类有威胁"）。⚠️ 少这一行 = 同一株被问两遍。
+            if getattr(p.field.spec, "named_hit", ()):
+                continue
+            asked.add(p)
             if atk.quan:
                 self.plans[p] = "ALL"
                 self.say("%s 释放【%s】→ 全体攻击！" % (p.tag, p.field.spec.name))
                 continue
-            if not self.others_alive(p):
+            if not self.attack_cands(p):
                 continue  # 没有可选目标就不释放
             if p.field.spec.nearest_target:
                 sides = self.nearest_sides(p)
@@ -2532,8 +2601,14 @@ class Game:
                 continue
             if atk.lian > 1:
                 bursters.append(p)
-            elif (atk.san > 1 or getattr(p.field.spec, "group_all", False)) \
-                    and len(self.others_alive(p)) > 1:
+            # ★【v0.77.1 修】群攻（group_all：163 火西瓜 / 85 玉米爆裂弹 / 109 火龙果）
+            #   【永远】走多目标题 —— 候选只剩一个人也照问，绝不自动锁定。
+            #   用户 2026-11-25："只有一人那不是还可以选择空目标嘛……为什么自动锁定啊"。
+            #   原来的条件 `and len(others_alive) > 1` 会让 1 个候选的人掉进单目标题
+            #   （只能选那一个、连"空目标"都没有），点名株那边更狠：直接锁死、不问。
+            #   散连击（san）没有"空目标"这回事，仍保留 len > 1 的老条件。
+            elif getattr(p.field.spec, "group_all", False) \
+                    or (atk.san > 1 and len(self.others_alive(p)) > 1):
                 spreaders.append(p)
             else:
                 shooters.append(p)
@@ -2542,33 +2617,41 @@ class Game:
 
         qs = [self._q_target(p) for p in shooters]
         qs += [self._q_targets(p) for p in spreaders]
-        qs += [self._q_burst_split(p, self.others_alive(p),
+        qs += [self._q_burst_split(p, self.attack_cands(p),
                                    p.field.spec.attack.lian) for p in bursters]
         ans = self.gather(qs) if qs else {}
         # 勾取者的"如果勾取成功，它打谁"：必须和母题【同时收齐】——
         # 否则勾取者能先看到别人的目标再表态（v0.46 番茄那条踩过的同一个坑）
-        self._hook_target_questions()
+        # 【v0.77.1】only = 这一批真的出了题的人 —— 批 9 的[点名]株要各自再问一遍
+        #   （它们的条件方案不许在这里被顺手问掉，也不许漏）。
+        self._hook_target_questions(only=asked)
         # 聚电的"收来之后打谁"：每个申请人各答一份
-        absorbed_jobs = self._absorbed_target_questions()
+        absorbed_jobs = self._absorbed_target_questions(only=asked)
         for p in shooters:
-            cands = self.others_alive(p)
+            cands = self.attack_cands(p)
             idx = ans[p.idx]
             target = next((c for c in cands if c.idx == idx), cands[0])
             self.plans[p] = [target]
             self.say("%s 释放【%s】→ 瞄准 %s" % (p.tag, p.field.spec.name, target.tag))
         for p in spreaders:
-            cands = self.others_alive(p)
+            cands = self.attack_cands(p)
             picked = []
             for idx in ans[p.idx]:
                 t = next((c for c in cands if c.idx == idx), None)
                 if t is not None:
                     picked.append(t)
             self.plans[p] = picked
-            self.say("%s 释放【%s】→ 散连击 %d 人：%s"
-                     % (p.tag, p.field.spec.name, len(picked),
-                        "、".join(t.tag for t in picked)))
+            if picked:
+                self.say("%s 释放【%s】→ 散连击 %d 人：%s"
+                         % (p.tag, p.field.spec.name, len(picked),
+                            "、".join(t.tag for t in picked)))
+            else:
+                # 【v0.77.1】群攻题面的「空目标」= 一个都不打（plans 里空表 = 出过手但不打人，
+                #   和"没登记 = 不出手"不是一回事：释放决定早在上游定了，别的效果照常）。
+                self.say("%s 释放【%s】→ 空目标（一个都不打）"
+                         % (p.tag, p.field.spec.name))
         for p in bursters:
-            cands = self.others_alive(p)
+            cands = self.attack_cands(p)
             by = {c.idx: c for c in cands}
             seq, cnt, tg = [], {}, []
             for tidx, c in ans[p.idx]:
@@ -2653,6 +2736,57 @@ class Game:
             return
         self._batch_start("—— 消除 / 废除 ——")
         self._cut_declare_phase()
+        self._batch_end()
+
+    def _declare_named(self):
+        """批 9：[点名]群攻（85 玉米爆裂弹 / 109 火龙果）—— 排在刀之后。
+
+        ★ 用户 2026-11-25："这两个东西对刀类有威胁 → 目标声明排在刀类之后。"
+          它们的名单写死在卡面上，本来不依赖别人选谁；但刀叶会想先切它们，
+          所以先让刀表态、它们再表态。
+        ★ 候选 = 名单上【在场】的植物（attack_cands），默认全选、可逐个取消 ——
+          与 163 火西瓜同一套题面（用户："不是不可选的全场"）。
+        ★★【v0.77.1 修】候选只剩一个人也【照样出题】，绝不自动锁定 +
+          "空目标"（一个都不选）是正当答案 —— 用户 2026-11-25：
+          "只有一人那不是还可以选择空目标嘛……为什么自动锁定啊"。
+          旧写法 `len(cands) == 1 → 直接 plans[p] = [cands[0]]`，玩家连"不打"都选不了。
+        ★ 名单上一个人都没有（`attack_cands` 空）→ 播一句、不落地（plans 里没有它 = 不出手）。
+        """
+        named = [p for p in self.players
+                 if p.alive and p in self.released and p.field is not None
+                 and getattr(p.field.spec, "named_hit", ())]
+        if not named:
+            return
+        self._batch_start("—— 点名群攻（玉米爆裂弹 · 火龙果）——")
+        qs, askers = [], []
+        for p in named:
+            spec = p.field.spec
+            cands = self.attack_cands(p)
+            if not cands:
+                self.say("%s 的【%s】→ 名单上没人在场，这一击落空"
+                         % (p.tag, spec.name))
+                continue
+            # ★ 不按人数分叉 —— 1 个候选也是"群攻题面"，照样问（可空目标）
+            qs.append(self._q_targets(p, cands=cands))
+            askers.append(p)
+        if qs:
+            ans = self.gather(qs)
+            for p in askers:
+                cands = self.attack_cands(p)
+                picked = [c for c in cands if c.idx in (ans.get(p.idx) or [])]
+                if picked:
+                    self.plans[p] = picked
+                    self.say("%s 释放【%s】→ 点名 %d 人：%s"
+                             % (p.tag, p.field.spec.name, len(picked),
+                                "、".join(t.tag for t in picked)))
+                else:
+                    # 空目标 = 谁都不打。不写 plans = 这一击不出手（"不在名单里"那条路同款）
+                    self.say("%s 释放【%s】→ 空目标（名单上的人一个都不打）"
+                             % (p.tag, p.field.spec.name))
+        # 这两株被[勾取] / [聚电] 时，支配者也要各答一份条件方案
+        only = set(named)
+        self._hook_target_questions(only=only)
+        self._apply_absorbed_targets(self._absorbed_target_questions(only=only))
         self._batch_end()
 
     def _declare_flash(self):
@@ -3013,6 +3147,62 @@ class Game:
                             "" if _boss is s else
                             "（这株已被 %s 支配 —— 收益归支配者，不回原主 %s）"
                             % (_boss.tag, s.tag)))
+
+    # ---------- 【v0.77.1】点名废除（85 / 109） ----------
+    def _named_void_phase(self):
+        """85 玉米爆裂弹 / 109 火龙果 的【点名[废除]】—— 结算 ⓪-b，排在刀类之前。
+
+        ★★ 为什么必须是"抢在一切出手之前"（而不是跟着自己那一发打完之后）：
+          [废除] 的语义就是"让这一株这一回合作废"。刀类之所以排在 ⓪-b，
+          就是用户 2026-10-21 定的"消除要赶在治疗与攻击之前，否则血已落袋、
+          这一刀只剩拆防御"。点名废除是同一个词条，不该有两套时序 ——
+          放到普通攻击批的话，序列比它高的对手早就出完手了，废了等于没废
+          （噬魂类更是排在普通攻击【之前】，晚一步就永远追不上）。
+        ★ 原稿把 (1)「造成一点伤害」写在 (2)「产生一次[废除]」前面 ——
+          那是【清单编号】，不是时序（刀类的原稿同样没写先后，是后来定的）。
+        ★ 为什么排在 ⓪-a [毁灭] 之后：黑洞是"强制启动 + 反馈"那一档，原稿明确它优先；
+          而且 [毁灭] 不看[不灭]、点名废除看 —— 先毁灭再废除，不给一张已经
+          不存在的牌做无用判定。
+        ★ 为什么在刀【之前】：用户 2026-11-25 说这两株"对刀类有威胁" ——
+          先把刀叶打成[空]，它这一回合就切不动别人了。
+        ★ 判定与刀类共用 _is_uncuttable（[不灭] 挡得住），但【不吃】
+          "刀叶类未互挡切不动"那一条 —— 这两株不是刀，没有互挡关系。
+        """
+        casters = [p for p in self.players
+                   if p.alive and p in self.released and p.field is not None
+                   and getattr(p.field.spec, "named_void", ())]
+        if not casters:
+            return
+        self.say("—— 点名废除（玉米爆裂弹 · 火龙果；排在刀类之前）——")
+        for p in self._attack_order(casters):
+            spec = p.field.spec
+            hit = False
+            for t in self.players:
+                if t is p or not t.alive or t.field is None:
+                    continue
+                if not named_match_any(spec.named_void, t.field.spec):
+                    continue
+                hit = True
+                self._named_void_one(p, t)
+            if not hit:
+                self.say("  · %s 的【%s】→ 废除名单上没人在场" % (p.tag, spec.name))
+
+    def _named_void_one(self, src, target):
+        """点名废除【一株】—— 判据与刀类同源，落地同走 _void_one。"""
+        spec, tspec = src.field.spec, target.field.spec
+        if getattr(target.field, "cut_gone", False):
+            self.say("  · %s 的【%s】→ %s 已成[空]，不再重复废除"
+                     % (src.tag, spec.name, target.tag))
+            return
+        if self._is_uncuttable(spec, tspec, self._cur_seg(target.field)):
+            self.say("  · %s 的【%s】想废除 %s 的【%s】→ 切不动"
+                     "（[不灭] / 免切 这一类理由）"
+                     % (src.tag, spec.name, target.tag, tspec.name))
+            return
+        self._void_one(target, "废除", by=self._holder(src))
+        self.say("  ◆ %s 的【%s】点名废除 %s 的【%s】→ 成[空]"
+                 "（防御、暴击归零；人还在）"
+                 % (src.tag, spec.name, target.tag, tspec.name))
 
     def _cut_resolve_phase(self):
         """把本回合声明的"切"兑现。
@@ -4189,7 +4379,7 @@ class Game:
                     out[owner] = hooker
         return out
 
-    def _hook_target_questions(self):
+    def _hook_target_questions(self, only=None):
         """替【真会出手】的被勾植物造"打谁"的题 —— 由勾取者答。
 
         ★ 用户 2026-10-22："声明那一步就要问'如果勾取成功，你要打谁'了"。
@@ -4212,6 +4402,10 @@ class Game:
         """
         items = []
         for owner, hooker in self._hook_act_map().items():
+            # 【v0.77.1】only = 这一批真的出了题的人。批 5 与批 9 各问各的一半，
+            #   不传就全问（老调用方式仍然可用）。
+            if only is not None and owner not in only:
+                continue
             atk = owner.field.spec.attack
             if atk.attr == ATTR_NONE:
                 continue          # 它本来就不打人（黑洞之类），没什么可问的
@@ -4220,15 +4414,17 @@ class Game:
             #   0 防，正好打穿），但【不能打勾取者自己】。
             #   旧写法 `others_alive(owner)` 恰好反着来：把勾取者列进候选、把原主人剔掉 ——
             #   用户原话："牛角菱自己的攻击目标里居然有自己，但是没有聚电蓝莓"。
-            cands = self.others_alive(hooker)
+            cands = self.attack_cands(owner, hooker)   # 【v0.77.1】[点名]株只列名单上的人
             if not cands:
                 continue
             if atk.lian > 1:
                 q = self._q_burst_split(owner, cands, atk.lian, by=hooker, cond=True)
                 items.append((owner, hooker, "burst", q))
             # 【v0.74】163 火西瓜：群攻（group_all）也走多目标题，和散连击共用同一个 kind。
-            elif (atk.san > 1 or getattr(owner.field.spec, "group_all", False)) \
-                    and len(cands) > 1:
+            # 【v0.77.1 修】group_all 不再要求"候选 > 1" —— 1 个候选也照问（可选空目标），
+            #   与 _declare_targets / _declare_named 三条路必须同一条判据。
+            elif getattr(owner.field.spec, "group_all", False) \
+                    or (atk.san > 1 and len(cands) > 1):
                 items.append((owner, hooker, "spread",
                               self._q_targets(owner, by=hooker, cands=cands, cond=True)))
             else:
@@ -4264,7 +4460,9 @@ class Game:
                 continue
             # ★【v0.72】与 _hook_target_questions 必须用【同一份】候选，
             #   否则答案编号对不上（候选按勾取者算：不含他、含原主人）。
-            cands = self.others_alive(hooker)
+            # ★ 与 _hook_target_questions 必须用【同一个】候选函数（v0.77.1 起是
+            #   attack_cands）—— 否则答案编号对不上。
+            cands = self.attack_cands(owner, hooker)
             spec = owner.field.spec
             if kind == "single":
                 t = next((c for c in cands if c.idx == v), cands[0] if cands else None)
@@ -4395,7 +4593,7 @@ class Game:
                 eff[_ow] = list(cond["absorb"])
         return eff
 
-    def _absorbed_target_questions(self):
+    def _absorbed_target_questions(self, only=None):
         """【v0.70 建 / v0.72 重写】被[聚电]收走那株的"打谁" —— 【每一方各答一份】。
 
         ★★ 用户 2026-10-27（第四次）报的就是这里：
@@ -4433,9 +4631,11 @@ class Game:
             for f in fields:
                 if f.player is caster or f.cut_gone or f.spec is EMPTY:
                     continue
+                if only is not None and f.player not in only:
+                    continue
                 if f.spec.attack.attr == ATTR_NONE:
                     continue
-                cands = self.others_alive(caster)
+                cands = self.attack_cands(f.player, caster)   # 【v0.77.1】[点名]株只列名单
                 if cands:
                     _add(f, caster, False, cands)
 
@@ -4449,9 +4649,11 @@ class Game:
             for f in cond["absorb"]:
                 if f.spec is EMPTY or f.cut_gone or f.player is hooker:
                     continue
+                if only is not None and f.player not in only:
+                    continue
                 if f.spec.attack.attr == ATTR_NONE:
                     continue
-                cands = self.others_alive(hooker)
+                cands = self.attack_cands(f.player, hooker)   # 【v0.77.1】同上
                 if cands:
                     _add(f, hooker, True, cands)
 
@@ -4467,8 +4669,9 @@ class Game:
                                               by=answerer, cond=True, verb="聚电"))
                 kinds.append("burst")
             # 【v0.74】163 火西瓜：群攻（group_all）也走多目标题，和散连击共用同一个 kind。
-            elif (atk.san > 1 or getattr(f.player.field.spec, "group_all", False)) \
-                    and len(cands) > 1:
+            # 【v0.77.1 修】group_all 不再要求"候选 > 1"（同 _declare_targets）
+            elif getattr(f.player.field.spec, "group_all", False) \
+                    or (atk.san > 1 and len(cands) > 1):
                 qs.append(self._q_targets(f.player, by=answerer, cands=cands,
                                           cond=True, verb="聚电"))
                 kinds.append("spread")
@@ -5459,6 +5662,10 @@ class Game:
         #     用户 2026-10-21 重申"动不了固有属性的是[毁灭]，不是消除/废除"。
         self._hook_pass("cut")
         self._feedback_pass("cut")   # 【v0.58】反馈先于这一步自己的效果判
+        # ⓪-b【v0.77.1】点名[废除]（85 玉米 / 109 火龙果）—— ★ 排在刀【之前】：
+        #   [废除] = 这一株这一回合作废，必须抢在它出手前（与刀类同一条理由）；
+        #   用户 2026-11-25 说这两株"对刀类有威胁" —— 先废刀叶，它就切不动了。
+        self._named_void_phase()
         self._cut_resolve_phase()
         # ①【v0.51】161 生命之花：加血 / 复活【二选一】—— ★ 必须在治疗之前，
         #   而且它的加血不走治疗（治疗是无条件加血，两个都做就超模了）。
@@ -5878,6 +6085,23 @@ class Game:
                      "（不削防、不破防、不掉血）"
                      % (desc, defender.player.tag, defender.player.super_def))
             return False
+        # 【v0.77.1】★ [穿透]（85 玉米爆裂弹 / 109 火龙果，卡面暴击栏写的就是它）：
+        #   这一击【越过防御】—— 不削防、不看守方防御多少，直接落在人身上。
+        #   ★ 排在这里的两个理由，都是硬的：
+        #     · 必须在【超防闸门之后】—— 穿透 ≠ 无视超防。玉米只有穿透，
+        #       对方挂着超防照样整击作废；火龙果两条都开（原稿"无视超防"）。
+        #     · 必须在所有削防分支【之前】—— 否则会先减守方的 fang，
+        #       那就不是"穿透"而是"暴击很大"了。
+        #   ★ 效果与"无视标签 / 特殊克制"那两条一致（broken + 直击 + 算造成伤害），
+        #     只是判据【无条件】：不看标签、不点名。"同一件事只有一个落点"。
+        if a.pierce:
+            defender.broken = True
+            self.say("%s：【%s】带[穿透] → 越过防御直击 —— %s"
+                     % (desc, attacker.spec.name,
+                        self._hurt_text(defender.player, a.damage, a.super_pierce)))
+            self.fire("on_break", defender, {"attacker": attacker})
+            self._dealt_damage(attacker)
+            return True
         # 【v0.33】★★【免切①者穿透金刚刀叶的防御】—— 原稿 p06 金刚刀叶防御栏写的是
         #   「20（除使不可切/无视）」：那 20 点防御对"不可切者"（= 有免切①的植物）
         #   是【不适用】的。用户 2026-09-29 实测发现没实现，拍板口径：
@@ -6191,6 +6415,12 @@ class Game:
             return
         self.fire("on_attack", attacker, {})
         targets = self._plan_targets(p)
+        # 【v0.77.1】群攻题面的「空目标」= 一个都不打。plans 里是空表，不是"没登记"——
+        #   这里播一句，然后让它照常走完（循环 0 次、_flush_damage 空转）；
+        #   ⚠️ 别 return：收尾的 _flush_damage 是"本株打完了"的落地点，跳过它不划算。
+        if not targets:
+            self.say("  · %s 的【%s】→ 空目标（这一击不打任何人）"
+                     % (p.tag, attacker.spec.name))
         # 【v0.37】★★ summary = 把"逐发明细"压成"按目标一行"。
         #   用户 2026-09-30 原话："杨桃这类连接植物的日志太长太冗余，压缩到打了
         #   具体某个人几发就可以"，并明确"打了两个目标可以分两行，按目标算行数"。
@@ -6447,6 +6677,24 @@ class Game:
         if self.plans[p] == "ALL":
             return self.others_alive(p)
         return self.plans[p]
+
+    def attack_cands(self, owner, viewer=None):
+        """【v0.77.1】这一株【能打谁】—— 所有"选目标"题的【唯一】候选来源。
+
+        ★ 为什么要收成一处：85 玉米爆裂弹 / 109 火龙果 的克制是【点名名单】，
+          候选只能是名单上在场的人。而"算候选"原本散在七八处
+          （本人 / 勾取者 / 聚电者 / 聚电后 / …），逐处加过滤必漏一处 ——
+          本项目踩过太多"同一件事多个落点"的坑（v0.17 充能文案、v0.39 猫尾草）。
+        ★ viewer = 【谁来选】：勾取 / 聚电时传支配者 ——
+          那一株可以打原主人（他的牌已经空了），但不能打支配者自己。
+        ★ 名单为空 = 全场其余存活者 —— 其余 38 株的行为一字不变。
+        """
+        base = self.others_alive(viewer or owner)
+        names = getattr(owner.field.spec, "named_hit", ())
+        if not names:
+            return base
+        return [c for c in base
+                if c.field is not None and named_match_any(names, c.field.spec)]
 
     def devour_preview(self, attacker, defender):
         """【v0.21】预览：这一口吞得动吗？—— 只给界面显示用，不改动任何状态。
@@ -6758,8 +7006,9 @@ class Game:
         """
         # 【v0.70】cands 允许外部给：被[聚电]收走的植物，候选要按【支配者】算
         #   （不能包含支配者自己），但攻击数值仍用被收那株的。
+        # 【v0.77.1】默认候选统一走 attack_cands —— [点名]株只列名单上的人。
         if cands is None:
-            cands = self.others_alive(p)
+            cands = self.attack_cands(p)
         idxs = {c.idx for c in cands}
         spec = p.field.spec
         return Question(
@@ -6814,10 +7063,12 @@ class Game:
         与"连击"的区别：连击是把 N 下都砸在同一个人身上，散连击必须分给不同的人。
         答案是一个列表（玩家编号），count 已按存活人数收紧。"""
         if cands is None:
-            cands = self.others_alive(p)
+            # 【v0.77.1】统一走 attack_cands —— [点名]株的候选只有名单上的人
+            cands = self.attack_cands(p)
         idxs = {c.idx for c in cands}
         # 【v0.74】163 火西瓜：群攻「默认全选、逐个取消」——
-        #   count 报【全部候选】（界面据此把它们全勾上），答案长度 1~N 都合法，
+        #   count 报【全部候选】（界面据此把它们全勾上），答案长度 0~N 都合法
+        #   （0 个 = 空目标：这一击不打人，【v0.77.1】起允许，见下面的 ok()），
         #   玩家自己一个个减掉。其余植物（散连击 san）照旧：必须恰好 count 个、
         #   且互不相同 —— 两者只在 group_all 上分叉，别混。
         group = bool(getattr(p.field.spec, "group_all", False))
@@ -6831,8 +7082,11 @@ class Game:
                        for x in v):
                 return False
             if group:
-                # 任意多个，但不许一个都不选（全不选等于白放，不如直接不释放）
-                return 1 <= len(v) <= count
+                # 【v0.77.1 修】任意多个，**包括 0 个** —— 群攻题面上「空目标」是正当答案：
+                #   一个人都不打 ≠ 不释放（释放决定是上一批的事，本株的其它效果照常落地）。
+                #   用户 2026-11-25："只有一人那不是还可以选择空目标嘛"。
+                #   旧写法 `1 <= len(v)` 把"至少留 1 个"写死了，界面也就照它把最后一个锁住。
+                return 0 <= len(v) <= count
             return len(v) == count
         return Question(
             "targets", by or p, self,

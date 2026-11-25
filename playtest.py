@@ -135,6 +135,8 @@ class Seat:
         #     一直常驻】的（见类注释），类属性在建立那一刻就固化了，而
         #     "这一局能不能回退"要等开局之后才知道 —— 所以得让它运行时再取。
         self.undo_hook = None
+        # 【v0.77.1】重做入口，同样开局时才接上。
+        self.redo_hook = None
         # 【v0.76】导出录像的入口，同样开局时才接上。
         self.replay_hook = None
 
@@ -151,6 +153,13 @@ class Seat:
         fn = self.replay_hook
         if fn is None:
             return None
+        return fn()
+
+    def _redo_request(self):
+        """【v0.77.1】座位页按「重做」的总入口（局内 / 局终两种都由 Lab 判）。"""
+        fn = self.redo_hook
+        if fn is None:
+            return False, "还没开局，没有可重做的回退"
         return fn()
 
     def url(self):
@@ -171,6 +180,7 @@ class Seat:
             "no_local": True,
             "session_ref": self.session,  # 【v0.74.1】「再来一局」用本座位自己的记录
             "undo_ref": self._undo_request,   # 【v0.76】回退（运行时才决定有没有）
+            "redo_ref": self._redo_request,   # 【v0.77.1】重做（同上）
             "replay_ref": self._replay_request,   # 【v0.76】导出录像（同上）
         })
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), cls)
@@ -208,6 +218,8 @@ class Lab:
         self.game_port = 0
         self.error = ""
         self.note = ""          # 【v0.76】"从录像续玩"时的补充说明（模糊匹配到了哪份）
+        # 【v0.77.1】局终回退时把"完整那局"留一份 —— 重做要用它续玩回去。
+        self._redo_end = None
         self._lock = threading.Lock()
 
     # ---------- 座位池 ----------
@@ -329,6 +341,7 @@ class Lab:
         #   失败时保持 None（座位页点它们只会得到"还没开局"）。
         for s in self.seats:
             s.undo_hook = self.request_undo     # ★ 走 Lab：局内 / 局终两种都能接
+            s.redo_hook = self.request_redo     # 【v0.77.1】同上
             s.replay_hook = self._current_replay
 
         # ---- 串行连接：连接顺序 = 座位号 ----
@@ -371,6 +384,8 @@ class Lab:
         """
         ok, err = self.room.request_undo(at)
         if ok:
+            # 【v0.77.1】局内又退了一次 → 之前"打完的样子"不再是未来，重做点作废
+            self._redo_end = None
             return ok, err
         g = getattr(self.room, "game", None)
         if g is None or not getattr(g, "record", None):
@@ -398,6 +413,35 @@ class Lab:
         if not ok2:
             with self.room._lock:
                 self.room.resume = None       # 没连成 → 别把"续玩前缀"留给下一局
+            return False, err2
+        # 【v0.77.1】"打完的样子"留一份，给「重做」用（在续玩前缀之外，两码事）
+        self._redo_end = g.replay_dict()
+        self._emit()
+        return True, None
+
+    def request_redo(self):
+        """【v0.77.1】重做（Ctrl+Y）：把上一次回退还回去。
+
+        两条路，和 request_undo 对称：
+          · 对局进行中、且是**局内**回退过的 → 交给 Room（栈里有重做点）；
+          · 是**局终**回退（打完一局退回来重打）→ 用 `_redo_end` 那一整局续玩回去，
+            等于"把刚打完的那一局恢复回来"（战绩会在这次终局时重新记上）。
+        ★ 判断顺序要紧：Room 能接就先给 Room —— 它认的是"局内回退"那条路；
+          Room 说没有重做点、而又存着整局录像时，才走续玩。
+        """
+        ok, err = self.room.request_redo()
+        if ok:
+            return ok, err
+        rec = self._redo_end
+        if not isinstance(rec, dict) or not rec.get("answers"):
+            return False, err
+        with self.room._lock:
+            self.room.resume = dict(rec)
+        self._redo_end = None
+        ok2, err2 = self._reconnect_seats()
+        if not ok2:
+            with self.room._lock:
+                self.room.resume = None
             return False, err2
         self._emit()
         return True, None

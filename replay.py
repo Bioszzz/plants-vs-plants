@@ -214,7 +214,9 @@ def build(data, output=None, extra_delay=0.0):
     g = Game(ctrls,
              output=output,
              playable=playable,                          # 当时用的牌库
-             duel_auto=bool(data.get("duel_auto", True)),
+             # 【v0.77.1】老录像记的是写死的那一个值（True/False），照抄；
+             #   新录像也照抄。都没有（更老的）→ None = 按 rules 里「全神贯注」走。
+             duel_auto=data.get("duel_auto"),
              rng=rng,
              start_seeds=data.get("start_seeds") or 0,
              rules=data.get("rules") or {},

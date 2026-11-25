@@ -489,21 +489,27 @@ class Mirror:
             t.cancel()
 
     def head(self, data):
-        """开局 / 回退重建：服务端发来本局的头（人数 / 种子 / 规则 / 牌库）。
+        """开局 / 回退重建：服务端发来本局的头（人数 / 种子 / 规则 / 牌库 / 答案）。
 
-        ★ 收到 head 就把本地累积清空重来 —— 回退后旧的那串答案已经作废了。
+        ★★ 回退重建时这份 head 里【带着已经答过的那些题】——必须原样收下。
+          v0.76 这里把 answers 清成空表，于是本地从第 0 回合重算，而服务端
+          已经从回退点接着跑：卡面落后一整回合（火西瓜明明已成[空]，卡片
+          还写着防 16）、战报回合数对不上，再往后就题型错位（2026-11-25 实机）。
+          ★ 判据：**服务端跑的是"这一串答案"，本地就必须从同一串答案跑**。
         """
         if not isinstance(data, dict):
             return
         with self._lock:
             d = dict(data)
-            d["answers"] = []
+            d["answers"] = [dict(r) for r in (data.get("answers") or [])]
             self.data = d
             self.shown = 0
             self._state = None
         # 【v0.77】开局那一帧：此时还没有任何答案，重放跑不出场面，
         #   所以直接建一局取初始 state —— 否则「服务器友好」下前端开局是空白卡片。
-        if self.push_events:
+        #   ★ 带着答案（回退重建）时【不推这一帧】：那会把"第 0 回合的空桌"
+        #     画上去闪一下；正确答案由下面的 _flush 算出来（0.12 秒后）。
+        if self.push_events and not d["answers"]:
             try:
                 import replay as _replay
                 st = _replay.build(dict(d)).state_json()
@@ -886,11 +892,14 @@ def start_local_game(bridge, total=2, bots=1, start_seeds=0, rules=None,
     try:
         # 【v0.63】加 --keep：本机服务端打完一局【不退出】，
         #   客户端点「再来一局」重连同一个端口就是下一局（座位名/战绩都还在）。
-        proc = subprocess.Popen([sys.executable or "python", script,
-                                 str(total), str(bots), str(port),
-                                 str(start_seeds), "--no-console", "--keep"]
-                                + rule_args,
-                                cwd=BASE_DIR)
+        # 【v0.77.1】`PVSP_NO_RECORD=1` 时顺手关掉落盘 —— 测试会走这个按钮，
+        #   不关就每次往 对局录像/ 里丢一局空录像（玩家点这个按钮时照常录）。
+        _args = [sys.executable or "python", script,
+                 str(total), str(bots), str(port),
+                 str(start_seeds), "--no-console", "--keep"] + rule_args
+        if os.environ.get("PVSP_NO_RECORD") == "1":
+            _args.append("--no-record")
+        proc = subprocess.Popen(_args, cwd=BASE_DIR)
     except OSError as e:
         return False, "启动本机服务端失败：%s" % e
     LOCAL["proc"] = proc
@@ -1015,6 +1024,9 @@ class Handler(BaseHTTPRequestHandler):
     #   ★ 为什么不做成"发个 HTTP 去问 netserver"：本机局的 netserver 是子进程，
     #     控制台端口是多少、开没开，webui 这边一概不知道。能直连的就直连。
     undo_ref = None
+    # 【v0.77.1】redo_ref —— 「重做（Ctrl+Y）」，和 undo_ref 一起塞。
+    #   None = 不支持；试玩台会指到 Lab.request_redo。
+    redo_ref = None
     # 【v0.76】replay_ref —— 「导出本局录像」，同样是个 callable（试玩台才有）。
     #   None = 这个页面不支持导出（普通单开），前端就不显示那个按钮。
     #   返回 replay_dict() 或 None。
@@ -1081,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
         #      没确认它属于哪个 do_*。）
         if path == "/api/caps":
             return self._json({"undo": self.undo_ref is not None,
+                               # 【v0.77.1】重做按钮跟着回退一起出现
+                               "redo": self.redo_ref is not None,
                                "replay": self.replay_ref is not None,
                                # 【v0.76】这个页面要不要显示「玩家选项」。
                                #   试玩台的座位页为 False —— 那 N 个座位共用一个进程，
@@ -1133,6 +1147,16 @@ class Handler(BaseHTTPRequestHandler):
             except TypeError:
                 # 老的 undo_ref 只收 0 个参数 —— 别为了一个按钮把整个接口打崩
                 ok, err = fn()
+            return self._json({"ok": ok, "err": err})
+
+        # 【v0.77.1】重做（Ctrl+Y）：把上一次回退还回去。
+        #   ★ 和 /api/undo 一样，ok=True 只代表"要求已记下"——
+        #     真正的重建发生在服务端接住 RedoRequest 那一刻，前端靠 reset 确认。
+        if path == "/api/redo":
+            fn = self.redo_ref
+            if fn is None:
+                return self._json({"ok": False, "err": "这一局不支持重做"})
+            ok, err = fn()
             return self._json({"ok": ok, "err": err})
 
         # 【v0.76】把本局录像【直接存进项目的 对局录像/】，返回文件名。

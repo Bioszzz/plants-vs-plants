@@ -445,6 +445,23 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeUndoPick();
 });
 
+/* 【v0.78】重做（Ctrl+Y 的右边那一半）：把上一次回退还回去。
+   ★ 语义只有一条：**回退之后有人答了新题，就没得重做**（未来已经变了）。
+     服务端那时会回一句人话，这里照原样显示在战报里，不做乐观禁用。 */
+$('btn-redo').onclick = () => {
+  const b = $('btn-redo');
+  if (b.disabled) return;
+  b.disabled = true;
+  b.textContent = '↷ 重做中…';
+  fetch('/api/redo', { method: 'POST' })
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) addLog('（没能重做：' + (j.err || '未知原因') + '）');
+    })
+    .catch(() => addLog('（重做请求没送到服务端）'))
+    .finally(() => { b.disabled = false; b.textContent = '↷ 重做'; });
+};
+
 /* 【v0.76】导出本局录像 —— 直接写进项目的 对局录像/，不进浏览器的下载目录。
    ★ 用下载的话：文件名长、还得自己拼相对路径才能重放（`python replay.py 对局录像/xxx.json`）。
      存进对局录像之后，`python replay.py` 不带参数就放最新那份。
@@ -471,6 +488,8 @@ fetch('/api/caps').then(r => r.json()).then(j => {
     $('btn-undo').classList.remove('hidden');
     $('btn-undo-more').classList.remove('hidden');   // 分裂按钮的小箭头
   }
+  // 【v0.78】重做按钮跟着回退一起出现（能不能重做由服务端当场判）
+  if (j && j.redo) $('btn-redo').classList.remove('hidden');
   if (j && j.replay) $('btn-replay').classList.remove('hidden');
   // 【v0.76】玩家选项：试玩台的座位页不给（N 个座位共用一个进程，各存一份录像没意义）
   if (j && j.prefs === false) {
@@ -778,7 +797,9 @@ function boardHtml(p) {
   else {
     const s = p.plant;
     let sub = '防御 ' + s.fang;
-    if (s.broken) sub += ' · <span class="broken">已被击破</span>';
+    // 【v0.78】成[空] 也带 inert，先判它 —— 否则被消除的牌显示"未释放"
+    if (s.cut_gone) sub += ' · <span class="inert">成空</span>';
+    else if (s.broken) sub += ' · <span class="broken">已被击破</span>';
     else if (s.inert) sub += ' · <span class="inert">未释放</span>';
     slot = '<div class="slot">' +
       '<div class="plant-art" style="' + artStyle(s.name) + '">' + s.name.charAt(0) + '</div>' +
@@ -1181,13 +1202,15 @@ function renderTarget(ev) {
 function renderTargets(ev) {
   const need = ev.count;
   // 【v0.74】163 火西瓜：群攻走同一个 kind，但语义是"默认全选、逐个取消"。
-  //   · default_all = true → 一开始就全勾上，点谁取消谁，至少留 1 个；
+  //   · default_all = true → 一开始就全勾上，点谁取消谁，**可以取消到一个都不剩**
+  //     （【v0.78 修】用户 2026-11-25："只有一人那不是还可以选择空目标嘛" ——
+  //      "至少留 1 个"是原来写死的，逼得只剩一个候选时连"不打"都选不了）；
   //   · 其余（散连击）照旧：必须恰好选 need 个。
   const all = !!ev.default_all;
   const picked = all ? ev.cands.map(c => c.idx) : [];
   const own = ev.own || {};
   const tip = all
-    ? '群攻：默认【全场所有人】，点谁就取消谁（至少留 1 个）'
+    ? '群攻：默认【名单上所有人】，点谁就取消谁；都取消了 = 空目标（谁都不打）'
     : '散连击：选 ' + need + ' 个【不同】的目标，每人挨 1 下';
   let h = qfrom(own) + qproxy(own) +
     '<div class="qtip">' + tip + '</div>' +
@@ -1200,24 +1223,32 @@ function renderTargets(ev) {
       '<div class="t-sub">' + targetSub(c) + '</div></button>';
   });
   h += '</div><div class="row" style="margin-top:10px">' +
+    (all ? '<button class="btn" id="none">✕ 空目标（谁都不打）</button>' : '') +
     '<button class="btn primary" id="ok">确定</button></div>';
   setDeck(h);
-  $('ok').disabled = all ? picked.length < 1 : picked.length !== need;
+  $('ok').disabled = all ? false : picked.length !== need;
   document.querySelectorAll('.tcard').forEach(b => {
     b.onclick = () => {
       const v = parseInt(b.dataset.v, 10);
       const i = picked.indexOf(v);
       if (i >= 0) {
-        if (all && picked.length <= 1) return;   // 群攻至少留 1 个
         picked.splice(i, 1); b.classList.remove('sel');
       } else {
         if (picked.length >= need) return;
         picked.push(v); b.classList.add('sel');
       }
       $('cnt').textContent = picked.length;
-      $('ok').disabled = all ? picked.length < 1 : picked.length !== need;
+      $('ok').disabled = all ? false : picked.length !== need;
     };
   });
+  const none = document.getElementById('none');
+  if (none) {
+    // 空目标 = 正当答案（释放了这一株，但不打任何人；它别的效果照常结算）
+    none.onclick = () => {
+      document.querySelectorAll('.tcard').forEach(x => { x.disabled = true; });
+      answer([]);
+    };
+  }
   $('ok').onclick = () => {
     document.querySelectorAll('.tcard').forEach(x => { x.disabled = true; });
     answer(picked);
@@ -1509,7 +1540,8 @@ function mySummaryHtml() {
   } else {
     const s = me.plant;
     let tail = '防 ' + s.fang;
-    if (s.broken) tail += ' · <span class="ms-warn">已被击破</span>';
+    if (s.cut_gone) tail += ' · <span class="ms-warn">成空</span>';
+    else if (s.broken) tail += ' · <span class="ms-warn">已被击破</span>';
     else if (s.inert) tail += ' · <span class="ms-warn">未释放</span>';
     plant = '【' + esc(s.name) + '】' + tail;
   }

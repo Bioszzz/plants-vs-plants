@@ -28,6 +28,9 @@
            ★ 用户 2026-11-16："多态不应该影响方便性" —— 常用动作必须一下点完。 -->
       <button id="btn-undo" class="chip hidden" title="退回本回合开始（手抖了用）">↶ 回退</button>
       <button id="btn-undo-more" class="chip caret hidden" title="退到上一回合 / 指定回合">▾</button>
+      <!-- 【v0.78】重做 = Ctrl+Y 的右边那一半：把刚才那次回退还回去。
+           ★ 回退之后只要有人答了新题，服务端就说"没法重做"（未来已经变了）。 -->
+      <button id="btn-redo" class="chip hidden" title="把上一次回退还回去（回退之后有人答了新题就失效）">↷ 重做</button>
       <button id="btn-replay" class="chip hidden" title="把这一局导出成录像文件（可用 replay.py 重放）">⭳ 录像</button>
       <button id="btn-disc" class="chip hidden">断开</button>
       <span id="round-chip" class="chip">第 0 回合</span>
